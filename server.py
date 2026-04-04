@@ -34,7 +34,7 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 mcp = FastMCP(
-    "tts",
+    "mod3",
     instructions=(
         "Mod³ TTS server with multi-model support (Voxtral, Kokoro, Chatterbox, Spark) "
         "running locally on Apple Silicon. "

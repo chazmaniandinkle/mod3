@@ -36,7 +36,7 @@ Then add to your project's `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "tts": {
+    "mod3": {
       "command": "/path/to/mod3/.venv/bin/python",
       "args": ["/path/to/mod3/server.py"]
     }

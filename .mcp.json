@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "tts": {
+    "mod3": {
       "command": "${MOD3_ROOT}/.venv/bin/python",
       "args": ["${MOD3_ROOT}/server.py"],
       "env": {}
