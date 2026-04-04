@@ -413,6 +413,92 @@ def health():
 
 
 # ---------------------------------------------------------------------------
+# Modality Bus endpoints
+# ---------------------------------------------------------------------------
+
+from bus import ModalityBus
+from modules.text import TextModule
+from modules.voice import VoiceModule
+
+_bus = ModalityBus()
+_bus.register(TextModule())
+_bus.register(VoiceModule())
+
+
+@app.get("/v1/bus/hud")
+def bus_hud():
+    """Agent HUD — live state of all modalities, channels, and queues."""
+    return _bus.hud()
+
+
+@app.get("/v1/bus/health")
+def bus_health():
+    """Full modality bus health report."""
+    return _bus.health()
+
+
+@app.post("/v1/bus/perceive")
+async def bus_perceive(file: UploadFile, modality: str = "voice", channel: str = ""):
+    """Run raw input through the modality bus: gate → decode → cognitive event."""
+    raw = await file.read()
+    event = _bus.perceive(raw, modality=modality, channel=channel)
+    if event is None:
+        return {"status": "filtered", "modality": modality, "channel": channel}
+    return {
+        "status": "ok",
+        "event": {
+            "modality": event.modality.value,
+            "content": event.content,
+            "confidence": event.confidence,
+            "source_channel": event.source_channel,
+            "timestamp": event.timestamp,
+            "metadata": event.metadata,
+        },
+    }
+
+
+@app.post("/v1/bus/act")
+def bus_act(req: dict):
+    """Route a cognitive intent through the bus: resolve modality → encode → queue.
+
+    Body: {"content": "hello world", "modality": "voice", "channel": "discord-voice",
+           "voice": "bm_lewis", "speed": 1.25}
+    """
+    from modality import CognitiveIntent, ModalityType
+
+    content = req.get("content", "")
+    modality = req.get("modality")
+    channel = req.get("channel", "")
+    metadata = {}
+    for k in ("voice", "speed", "emotion"):
+        if k in req:
+            metadata[k] = req[k]
+
+    intent = CognitiveIntent(
+        modality=ModalityType(modality) if modality else None,
+        content=content,
+        target_channel=channel,
+        metadata=metadata,
+    )
+
+    result = _bus.act(intent, channel=channel, blocking=True)
+
+    return {
+        "status": "ok",
+        "modality": result.modality.value,
+        "format": result.format,
+        "duration_sec": result.duration_sec,
+        "bytes": len(result.data),
+        "metadata": result.metadata,
+    }
+
+
+def get_bus() -> ModalityBus:
+    """Get the global bus instance (for server.py integration)."""
+    return _bus
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
