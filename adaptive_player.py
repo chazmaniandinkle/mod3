@@ -279,6 +279,16 @@ class AdaptivePlayer:
             self._stream = None
             self._playing = False
 
+    def flush(self):
+        """Discard everything and stop playback immediately."""
+        with self._buffer_lock:
+            self._buffer.clear()
+        self._generation_done = True
+        self._stop_stream()
+        self._drain_event.set()
+        self._stream_finished.set()
+        self._done_event.set()
+
     def _build_metrics(self) -> PlaybackMetrics:
         duration = self._total_queued_samples / self.sample_rate
         now = time.perf_counter()

@@ -5,15 +5,19 @@ Multi-model support: Voxtral, Kokoro, Chatterbox, Spark.
 Voice presets are resolved to the correct engine automatically.
 
 Tools:
-  speak(text, voice, stream) — synthesize and play, returns structured metrics
-  list_voices()              — list available voice presets
-  diagnostics()              — engine state + last generation metrics
+  speak(text, voice, speed, emotion) — non-blocking speech, returns job ID
+  speech_status(job_id)              — check job or get latest metrics
+  stop()                             — interrupt current speech
+  list_voices()                      — list available voice presets
+  set_output_device(device)          — list/switch audio output
+  diagnostics()                      — engine state + last metrics
 """
 
 import json
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 import numpy as np
 import pysbd
@@ -35,10 +39,10 @@ mcp = FastMCP(
         "Mod³ TTS server with multi-model support (Voxtral, Kokoro, Chatterbox, Spark) "
         "running locally on Apple Silicon. "
         "Use the `speak` tool to say something out loud through the user's speakers. "
-        "Use `list_voices` to see available voice presets. "
-        "Keep spoken text conversational and concise — this is voice, not a document. "
-        "The speak tool returns structured JSON metrics including timing, buffer health, "
-        "and per-chunk generation stats — use these to diagnose audio quality issues."
+        "speak() is non-blocking — it returns immediately while audio plays in the background. "
+        "Use `speech_status` to check completion and get metrics. "
+        "Use `stop` to interrupt current speech. "
+        "Keep spoken text conversational and concise — this is voice, not a document."
     ),
 )
 
@@ -85,13 +89,14 @@ MODELS = {
     },
 }
 
+MAX_JOBS = 20
 _models: dict = {}
 _model_lock = threading.Lock()
 _last_metrics: dict | None = None
-_output_device: int | str | None = None  # audio output device (None = system default)
-
-# Job tracking for non-blocking speech
-_jobs: dict[str, dict] = {}  # id -> {status, metrics, error, start_time}
+_output_device: int | str | None = None
+_jobs: OrderedDict[str, dict] = OrderedDict()
+_current_player: AdaptivePlayer | None = None
+_current_player_lock = threading.Lock()
 
 
 def _resolve_model(voice: str) -> tuple[str, str]:
@@ -111,6 +116,12 @@ def _get_model(engine: str):
     return _models[engine]
 
 
+def _prune_jobs():
+    """Keep only the last MAX_JOBS entries."""
+    while len(_jobs) > MAX_JOBS:
+        _jobs.popitem(last=False)
+
+
 # ---------------------------------------------------------------------------
 # Adaptive playback
 # ---------------------------------------------------------------------------
@@ -121,12 +132,16 @@ def _start_speech(
     stream: bool = True,
     streaming_interval: float = 1.0,
     speed: float = 1.0,
+    emotion: float = 0.5,
 ) -> str:
     """Start non-blocking speech generation. Returns job ID immediately."""
-    global _last_metrics
+    global _last_metrics, _current_player
     engine, voice = _resolve_model(voice)
     model = _get_model(engine)
     player = AdaptivePlayer(sample_rate=model.sample_rate, device=_output_device)
+
+    with _current_player_lock:
+        _current_player = player
 
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {
@@ -137,17 +152,22 @@ def _start_speech(
         "start_time": time.time(),
         "metrics": None,
         "error": None,
+        "player": player,
     }
+    _prune_jobs()
 
     def _run():
         try:
-            _generate_sentences(model, engine, voice, text, player, stream, streaming_interval, speed, sample_rate=model.sample_rate)
+            _generate_sentences(
+                model, engine, voice, text, player,
+                stream, streaming_interval, speed, emotion,
+                sample_rate=model.sample_rate,
+            )
         except Exception as e:
             _jobs[job_id]["error"] = str(e)
         finally:
             player.mark_done()
 
-        # Wait for playback to finish, then collect metrics
         metrics = player.wait(timeout=120.0)
         result = metrics.to_dict()
         result["engine"] = engine
@@ -156,22 +176,26 @@ def _start_speech(
         _jobs[job_id]["status"] = "error" if _jobs[job_id]["error"] else "done"
         _last_metrics = result
 
+        with _current_player_lock:
+            global _current_player
+            if _current_player is player:
+                _current_player = None
+
     threading.Thread(target=_run, daemon=True).start()
     return job_id
 
 
-def _generate_sentences(model, engine, voice, text, player, stream, streaming_interval, speed, *, sample_rate: int):
+def _generate_sentences(model, engine, voice, text, player, stream, streaming_interval, speed, emotion, *, sample_rate: int):
     """Generate audio sentence-by-sentence into the adaptive player."""
     sentences = _split_sentences(text)
     feather = int(sample_rate * 0.02)
-    gap = np.zeros(int(sample_rate * 0.1), dtype=np.float32)
 
     for si, sentence in enumerate(sentences):
         chunks_in_sentence = []
         gen_kwargs = dict(text=sentence, verbose=False)
         cfg = MODELS[engine]
         if engine == "chatterbox":
-            gen_kwargs["exaggeration"] = speed
+            gen_kwargs["exaggeration"] = emotion
             gen_kwargs["stream"] = stream
             gen_kwargs["streaming_interval"] = streaming_interval
         elif engine == "spark":
@@ -204,7 +228,10 @@ def _generate_sentences(model, engine, voice, text, player, stream, streaming_in
             player.queue_audio(audio, chunk_meta=chunk_meta)
             chunks_in_sentence.append(True)
 
+        # Adaptive sentence gap: scale with sentence length
         if si < len(sentences) - 1 and chunks_in_sentence:
+            gap_sec = min(0.2, 0.05 + len(sentence) * 0.001)
+            gap = np.zeros(int(sample_rate * gap_sec), dtype=np.float32)
             player.queue_audio(gap)
 
 
@@ -225,6 +252,7 @@ def speak(
     voice: str = "bm_lewis",
     stream: bool = True,
     speed: float = 1.25,
+    emotion: float = 0.5,
 ) -> str:
     """Synthesize text to speech and play it through the user's speakers.
 
@@ -238,12 +266,13 @@ def speak(
         stream: If True, plays audio chunks as they generate (lower latency).
                 If False, generates all audio first then plays (better prosody).
         speed: Speed multiplier (engines with speed support). Default 1.25.
+        emotion: Emotion/exaggeration intensity 0.0-1.0 (Chatterbox only). Default 0.5.
     """
     if not text.strip():
         return json.dumps({"status": "error", "error": "Nothing to say"})
 
     try:
-        job_id = _start_speech(text, voice, stream=stream, speed=speed)
+        job_id = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)
         return json.dumps({"status": "speaking", "job_id": job_id})
     except ValueError as e:
         return json.dumps({"status": "error", "error": str(e)})
@@ -259,16 +288,17 @@ def speak(
         "openWorldHint": False,
     }
 )
-def speech_status(job_id: str = "") -> str:
+def speech_status(job_id: str = "", verbose: bool = False) -> str:
     """Check status of a speech job, or get the most recent result.
 
     Args:
         job_id: The job ID returned by speak(). If empty, returns the latest job.
+        verbose: If True, include per-chunk metrics. Default False (summary only).
     """
     if not job_id:
         if not _jobs:
             return json.dumps({"status": "idle", "message": "No speech jobs"})
-        job_id = max(_jobs, key=lambda k: _jobs[k]["start_time"])
+        job_id = next(reversed(_jobs))
 
     job = _jobs.get(job_id)
     if not job:
@@ -278,10 +308,39 @@ def speech_status(job_id: str = "") -> str:
     if job["status"] == "speaking":
         result["elapsed_sec"] = round(time.time() - job["start_time"], 1)
     if job["metrics"]:
-        result["metrics"] = job["metrics"]
+        metrics = job["metrics"]
+        if not verbose and "chunks" in metrics:
+            # Summarize chunks instead of returning all per-chunk data
+            chunks = metrics["chunks"]["per_chunk"]
+            rtfs = [c["rtf"] for c in chunks if c.get("rtf")]
+            metrics = {**metrics, "chunks": {
+                "count": metrics["chunks"]["count"],
+                "avg_rtf": round(sum(rtfs) / len(rtfs), 2) if rtfs else 0,
+                "min_rtf": round(min(rtfs), 2) if rtfs else 0,
+            }}
+        result["metrics"] = metrics
     if job["error"]:
         result["error"] = job["error"]
     return json.dumps(result)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def stop() -> str:
+    """Stop current speech playback immediately."""
+    with _current_player_lock:
+        player = _current_player
+    if player is None:
+        return json.dumps({"status": "ok", "message": "Nothing playing"})
+
+    player.flush()
+    return json.dumps({"status": "ok", "message": "Speech interrupted"})
 
 
 @mcp.tool(
@@ -298,7 +357,11 @@ def list_voices() -> str:
     for engine, cfg in MODELS.items():
         extras = []
         if cfg.get("supports_speed"):
-            extras.append("speed control")
+            extras.append("speed")
+        if cfg.get("supports_exaggeration"):
+            extras.append("emotion")
+        if cfg.get("supports_pitch"):
+            extras.append("pitch")
         tag = f" ({', '.join(extras)})" if extras else ""
         lines.append(f"  {engine}{tag}: {', '.join(cfg['voices'])}")
     return "Available voices:\n" + "\n".join(lines)
@@ -324,6 +387,9 @@ def diagnostics() -> str:
         }
     info = {
         "engines": engines,
+        "active_jobs": sum(1 for j in _jobs.values() if j["status"] == "speaking"),
+        "total_jobs": len(_jobs),
+        "output_device": _output_device,
         "last_metrics": _last_metrics,
     }
     return json.dumps(info, indent=2)
@@ -362,7 +428,6 @@ def set_output_device(device: str = "") -> str:
         lines = [f"  [{'*' if d['active'] else ' '}] {d['index']}: {d['name']}" for d in outputs]
         return "Audio output devices (* = active):\n" + "\n".join(lines)
 
-    # Set device
     if device.isdigit():
         _output_device = int(device)
     else:
