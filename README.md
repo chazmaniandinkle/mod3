@@ -26,7 +26,7 @@ Models are downloaded on first use via HuggingFace Hub.
 ## Quick Start
 
 ```bash
-git clone https://github.com/slowbro/mod3.git
+git clone https://github.com/chazmaniandinkle/mod3.git
 cd mod3
 ./setup.sh
 ```
@@ -46,27 +46,36 @@ Then add to your project's `.mcp.json`:
 
 ## MCP Tools
 
-### `speak(text, voice?, stream?, speed?)`
+### `speak(text, voice?, stream?, speed?, emotion?)`
 
 Synthesize text and play through speakers. Returns immediately with a job ID.
 
 ```
-speak("Hello world")                          → default voice (bm_lewis @ 1.25x)
-speak("Hello world", voice="casual_male")     → Voxtral
-speak("Hello world", voice="chatterbox", speed=0.8)  → Chatterbox with emotion
+speak("Hello world")                                        → default voice (bm_lewis @ 1.25x)
+speak("Hello world", voice="casual_male")                   → Voxtral
+speak("Hello world", voice="chatterbox", emotion=0.8)       → Chatterbox with high emotion
+speak("Hello world", voice="am_michael", speed=1.4)         → Kokoro fast
 ```
 
-### `speech_status(job_id?)`
+### `speech_status(job_id?, verbose?)`
 
-Check if speech is still playing, or get metrics from the last completed job.
+Check if speech is still playing, or get metrics from the last completed job. Pass `verbose=True` for per-chunk detail.
+
+### `stop()`
+
+Interrupt current speech immediately.
 
 ### `list_voices()`
 
-List all available voices grouped by engine.
+List all available voices grouped by engine, with control surface tags.
+
+### `set_output_device(device?)`
+
+List audio output devices, or switch the active one mid-session.
 
 ### `diagnostics()`
 
-Show loaded models, memory usage, and last generation metrics.
+Show loaded engines, active jobs, output device, and last generation metrics.
 
 ## Architecture
 
