@@ -1,10 +1,15 @@
 """
-Mod³ TTS MCP Server — gives Claude a voice via multiple TTS engines on Apple Silicon.
+Mod³ TTS Server — gives Claude a voice via multiple TTS engines on Apple Silicon.
 
 Multi-model support: Voxtral, Kokoro, Chatterbox, Spark.
 Voice presets are resolved to the correct engine automatically.
 
-Tools:
+Interfaces:
+  MCP (default):  stdio-based MCP tools for Claude Code
+  HTTP (--http):  REST API for OpenClaw and external consumers
+  Both (--all):   MCP on stdio + HTTP on a port, shared model cache
+
+Tools (MCP):
   speak(text, voice, speed, emotion) — non-blocking speech, returns job ID
   speech_status(job_id)              — check job or get latest metrics
   stop()                             — interrupt current speech
@@ -20,18 +25,10 @@ import uuid
 from collections import OrderedDict
 
 import numpy as np
-import pysbd
 from mcp.server.fastmcp import FastMCP
 
 from adaptive_player import AdaptivePlayer
-
-_segmenter = pysbd.Segmenter(language="en", clean=False)
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences using pysbd."""
-    sentences = _segmenter.segment(text.strip())
-    return [s.strip() for s in sentences if s.strip()]
+from engine import MODELS, generate_audio, resolve_model, get_model, get_loaded_engines
 
 mcp = FastMCP(
     "mod3",
@@ -47,73 +44,15 @@ mcp = FastMCP(
 )
 
 # ---------------------------------------------------------------------------
-# Model registry
+# Job tracking (MCP only — local speaker playback)
 # ---------------------------------------------------------------------------
 
-MODELS = {
-    "voxtral": {
-        "id": "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit",
-        "voices": [
-            "casual_male", "casual_female", "cheerful_female",
-            "neutral_male", "neutral_female",
-            "fr_male", "fr_female", "es_male", "es_female",
-            "de_male", "de_female", "it_male", "it_female",
-            "pt_male", "pt_female", "nl_male", "nl_female",
-            "ar_male", "hi_male", "hi_female",
-        ],
-        "default_voice": "casual_male",
-    },
-    "kokoro": {
-        "id": "mlx-community/Kokoro-82M-bf16",
-        "voices": [
-            "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky",
-            "am_adam", "am_michael",
-            "bf_emma", "bf_isabella",
-            "bm_george", "bm_lewis",
-        ],
-        "default_voice": "af_heart",
-        "supports_speed": True,
-    },
-    "chatterbox": {
-        "id": "mlx-community/chatterbox-4bit",
-        "voices": ["chatterbox"],
-        "default_voice": "chatterbox",
-        "supports_exaggeration": True,
-    },
-    "spark": {
-        "id": "mlx-community/Spark-TTS-0.5B-bf16",
-        "voices": ["spark_male", "spark_female"],
-        "default_voice": "spark_male",
-        "supports_pitch": True,
-        "supports_speed": True,
-    },
-}
-
 MAX_JOBS = 20
-_models: dict = {}
-_model_lock = threading.Lock()
 _last_metrics: dict | None = None
 _output_device: int | str | None = None
 _jobs: OrderedDict[str, dict] = OrderedDict()
 _current_player: AdaptivePlayer | None = None
 _current_player_lock = threading.Lock()
-
-
-def _resolve_model(voice: str) -> tuple[str, str]:
-    """Given a voice name, return (engine_name, voice) or raise."""
-    for engine, cfg in MODELS.items():
-        if voice in cfg["voices"]:
-            return engine, voice
-    raise ValueError(f"Unknown voice '{voice}'. Use list_voices() to see options.")
-
-
-def _get_model(engine: str):
-    if engine not in _models:
-        with _model_lock:
-            if engine not in _models:
-                from mlx_audio.tts import load
-                _models[engine] = load(MODELS[engine]["id"])
-    return _models[engine]
 
 
 def _prune_jobs():
@@ -123,7 +62,7 @@ def _prune_jobs():
 
 
 # ---------------------------------------------------------------------------
-# Adaptive playback
+# Adaptive playback (MCP speaker output)
 # ---------------------------------------------------------------------------
 
 def _start_speech(
@@ -136,8 +75,8 @@ def _start_speech(
 ) -> str:
     """Start non-blocking speech generation. Returns job ID immediately."""
     global _last_metrics, _current_player
-    engine, voice = _resolve_model(voice)
-    model = _get_model(engine)
+    engine, voice = resolve_model(voice)
+    model = get_model(engine)
     player = AdaptivePlayer(sample_rate=model.sample_rate, device=_output_device)
 
     with _current_player_lock:
@@ -158,11 +97,12 @@ def _start_speech(
 
     def _run():
         try:
-            _generate_sentences(
-                model, engine, voice, text, player,
-                stream, streaming_interval, speed, emotion,
-                sample_rate=model.sample_rate,
-            )
+            for chunk in generate_audio(
+                text, voice=voice, stream=stream,
+                streaming_interval=streaming_interval,
+                speed=speed, emotion=emotion,
+            ):
+                player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
         except Exception as e:
             _jobs[job_id]["error"] = str(e)
         finally:
@@ -183,56 +123,6 @@ def _start_speech(
 
     threading.Thread(target=_run, daemon=True).start()
     return job_id
-
-
-def _generate_sentences(model, engine, voice, text, player, stream, streaming_interval, speed, emotion, *, sample_rate: int):
-    """Generate audio sentence-by-sentence into the adaptive player."""
-    sentences = _split_sentences(text)
-    feather = int(sample_rate * 0.02)
-
-    for si, sentence in enumerate(sentences):
-        chunks_in_sentence = []
-        gen_kwargs = dict(text=sentence, verbose=False)
-        cfg = MODELS[engine]
-        if engine == "chatterbox":
-            gen_kwargs["exaggeration"] = emotion
-            gen_kwargs["stream"] = stream
-            gen_kwargs["streaming_interval"] = streaming_interval
-        elif engine == "spark":
-            gen_kwargs["gender"] = "female" if voice == "spark_female" else "male"
-            gen_kwargs["speed"] = speed
-        else:
-            gen_kwargs["voice"] = voice
-            if cfg.get("supports_speed"):
-                gen_kwargs["speed"] = speed
-            else:
-                gen_kwargs["stream"] = stream
-                gen_kwargs["streaming_interval"] = streaming_interval
-
-        for result in model.generate(**gen_kwargs):
-            audio = np.array(result.audio).flatten().astype(np.float32)
-            chunk_meta = {
-                "gen_time_sec": round(result.processing_time_seconds, 4),
-                "rtf": round(result.real_time_factor, 2),
-                "samples": int(result.samples),
-                "tokens": result.token_count,
-                "is_final": result.is_final_chunk,
-                "sentence": si,
-                "peak_memory_gb": round(result.peak_memory_usage, 2),
-            }
-
-            if result.is_final_chunk and len(audio) > feather:
-                audio = audio.copy()
-                audio[-feather:] *= np.linspace(1, 0, feather, dtype=np.float32)
-
-            player.queue_audio(audio, chunk_meta=chunk_meta)
-            chunks_in_sentence.append(True)
-
-        # Adaptive sentence gap: scale with sentence length
-        if si < len(sentences) - 1 and chunks_in_sentence:
-            gap_sec = min(0.2, 0.05 + len(sentence) * 0.001)
-            gap = np.zeros(int(sample_rate * gap_sec), dtype=np.float32)
-            player.queue_audio(gap)
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +200,6 @@ def speech_status(job_id: str = "", verbose: bool = False) -> str:
     if job["metrics"]:
         metrics = job["metrics"]
         if not verbose and "chunks" in metrics:
-            # Summarize chunks instead of returning all per-chunk data
             chunks = metrics["chunks"]["per_chunk"]
             rtfs = [c["rtf"] for c in chunks if c.get("rtf")]
             metrics = {**metrics, "chunks": {
@@ -351,6 +240,39 @@ def stop() -> str:
         "openWorldHint": False,
     }
 )
+def vad_check(file_path: str, threshold: float = 0.5) -> str:
+    """Check if an audio file contains speech using Silero VAD.
+
+    Use this before transcription to avoid Whisper hallucinations on
+    silence or ambient noise.
+
+    Args:
+        file_path: Path to a WAV audio file.
+        threshold: Speech probability threshold 0-1 (default 0.5). Higher = stricter.
+    """
+    from vad import detect_speech_file, is_model_loaded
+    try:
+        result = detect_speech_file(file_path, threshold=threshold)
+        return json.dumps({
+            "has_speech": result.has_speech,
+            "confidence": result.confidence,
+            "speech_ratio": result.speech_ratio,
+            "num_segments": result.num_segments,
+            "total_speech_sec": result.total_speech_sec,
+            "total_audio_sec": result.total_audio_sec,
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)})
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
 def list_voices() -> str:
     """List all available voice presets grouped by engine."""
     lines = []
@@ -380,9 +302,8 @@ def diagnostics() -> str:
     engines = {}
     for name, cfg in MODELS.items():
         engines[name] = {
-            "loaded": name in _models,
+            "loaded": name in get_loaded_engines() or False,
             "model_id": cfg["id"],
-            "sample_rate": _models[name].sample_rate if name in _models else None,
             "voices": len(cfg["voices"]),
         }
     info = {
@@ -440,5 +361,33 @@ def set_output_device(device: str = "") -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _run_http(host: str = "0.0.0.0", port: int = 7860):
+    """Start the HTTP API server."""
+    import uvicorn
+    from http_api import app
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 if __name__ == "__main__":
-    mcp.run()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Mod³ TTS Server")
+    parser.add_argument("--http", action="store_true", help="Run HTTP API only")
+    parser.add_argument("--all", action="store_true", help="Run both MCP (stdio) and HTTP")
+    parser.add_argument("--port", type=int, default=7860, help="HTTP port (default: 7860)")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="HTTP bind address")
+    args = parser.parse_args()
+
+    if args.http:
+        _run_http(host=args.host, port=args.port)
+    elif args.all:
+        # HTTP in background thread, MCP on stdio
+        http_thread = threading.Thread(
+            target=_run_http,
+            kwargs={"host": args.host, "port": args.port},
+            daemon=True,
+        )
+        http_thread.start()
+        mcp.run()
+    else:
+        mcp.run()
