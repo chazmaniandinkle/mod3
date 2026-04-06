@@ -68,6 +68,7 @@ def detect_speech(
         VADResult with speech detection details.
     """
     model, utils = _get_model()
+    assert utils is not None, "VAD utils not loaded"
     get_speech_timestamps = utils[0]
 
     # Silero VAD expects 16kHz mono
