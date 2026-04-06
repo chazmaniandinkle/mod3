@@ -1,7 +1,7 @@
 """Voice modality module — the first non-trivial modality.
 
 Gate:    Silero VAD (is there speech?)
-Decoder: placeholder for STT (Whisper — not yet integrated, returns raw transcript)
+Decoder: WhisperDecoder — mlx_whisper STT with BoH hallucination filter
 Encoder: Mod³ TTS engines (Kokoro, Voxtral, Chatterbox, Spark)
 
 The encoder wraps engine.py and adaptive_player.py for local speaker output,
@@ -11,6 +11,7 @@ or returns raw audio bytes for channel delivery (Discord, HTTP).
 from __future__ import annotations
 
 import io
+import logging
 import struct
 import time
 
@@ -29,6 +30,8 @@ from modality import (
     ModuleState,
     ModuleStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -68,16 +71,96 @@ class VoiceGate(Gate):
 
 
 # ---------------------------------------------------------------------------
-# Decoder: STT (placeholder — accepts pre-transcribed text for now)
+# Decoder: WhisperDecoder — mlx_whisper STT
 # ---------------------------------------------------------------------------
 
-class VoiceDecoder(Decoder):
-    """Voice decoder. Currently accepts pre-transcribed text.
-    Future: integrate Whisper/MLX STT directly."""
+class WhisperDecoder(Decoder):
+    """Speech-to-text decoder using mlx_whisper on Apple Silicon.
+
+    Accepts PCM float32 bytes at 16kHz or a numpy float32 array directly.
+    Lazy-loads the model on first call; subsequent calls reuse it.
+    Applies BoH hallucination filter to transcripts.
+    """
+
+    DEFAULT_MODEL = "mlx-community/whisper-turbo"
+
+    def __init__(self, model: str | None = None):
+        self._model = model or self.DEFAULT_MODEL
+        self._loaded = False
+
+    def _ensure_model(self) -> None:
+        """Trigger model download/load on first use."""
+        if not self._loaded:
+            import mlx_whisper
+            # A dry-run transcribe forces the model to download & cache.
+            # mlx_whisper handles caching internally — subsequent calls
+            # with the same path_or_hf_repo are fast.
+            logger.info("WhisperDecoder: loading model %s (first call)", self._model)
+            mlx_whisper.transcribe(
+                np.zeros(16000, dtype=np.float32),  # 1 s of silence
+                path_or_hf_repo=self._model,
+            )
+            self._loaded = True
+            logger.info("WhisperDecoder: model ready")
 
     def decode(self, raw: bytes, **kwargs) -> CognitiveEvent:
-        # If raw is already text (pre-transcribed by external STT),
-        # wrap it as a cognitive event
+        import mlx_whisper
+        from vad import is_hallucination
+
+        # Accept a numpy array directly via kwarg, or convert raw bytes.
+        audio: np.ndarray | None = kwargs.get("audio")
+        if audio is None:
+            audio = np.frombuffer(raw, dtype=np.float32)
+
+        self._ensure_model()
+
+        result = mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=self._model,
+        )
+
+        transcript: str = result.get("text", "").strip()
+        language: str = result.get("language", "")
+
+        # Confidence heuristic: average segment-level no_speech_prob inverted.
+        segments = result.get("segments", [])
+        if segments:
+            avg_no_speech = sum(s.get("no_speech_prob", 0.0) for s in segments) / len(segments)
+            confidence = round(1.0 - avg_no_speech, 4)
+        else:
+            confidence = 0.0
+
+        if is_hallucination(transcript):
+            return CognitiveEvent(
+                modality=ModalityType.VOICE,
+                content="",
+                confidence=0.0,
+                metadata={"filtered": True, "reason": "hallucination", "original": transcript},
+            )
+
+        return CognitiveEvent(
+            modality=ModalityType.VOICE,
+            content=transcript,
+            source_channel=kwargs.get("channel", ""),
+            confidence=confidence,
+            metadata={
+                "language": language,
+                "num_segments": len(segments),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Decoder: PlaceholderDecoder — legacy pre-transcribed text path
+# ---------------------------------------------------------------------------
+
+class PlaceholderDecoder(Decoder):
+    """Accepts pre-transcribed text and wraps it as a CognitiveEvent.
+
+    Retained for reference and as a fallback when mlx_whisper is unavailable.
+    """
+
+    def decode(self, raw: bytes, **kwargs) -> CognitiveEvent:
         transcript = kwargs.get("transcript")
         if transcript is None:
             transcript = raw.decode("utf-8", errors="replace")
@@ -187,12 +270,13 @@ class VoiceModule(ModalityModule):
 
     def __init__(
         self,
+        decoder: Decoder | None = None,
         default_voice: str = "bm_lewis",
         default_speed: float = 1.25,
         vad_threshold: float = 0.5,
     ):
         self._gate = VoiceGate(threshold=vad_threshold)
-        self._decoder = VoiceDecoder()
+        self._decoder = decoder or WhisperDecoder()
         self._encoder = VoiceEncoder(default_voice=default_voice, default_speed=default_speed)
 
     @property

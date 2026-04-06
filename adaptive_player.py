@@ -124,6 +124,9 @@ class AdaptivePlayer:
         self._startup_delay = 0.0
         self._peak_memory_gb = 0.0
 
+        # Progress tracking (for PipelineState position updates)
+        self._samples_played = 0
+
         # Synchronization: set when mark_done() is called
         self._done_event = Event()
 
@@ -148,6 +151,9 @@ class AdaptivePlayer:
                     self._buffer[0] = buf[to_copy:]
 
             current_buffer = sum(map(len, self._buffer))
+
+        # Progress tracking (lock-free; only written here in audio thread)
+        self._samples_played += filled
 
         # Metrics
         if filled > 0 and self._first_pull_time is None:
@@ -235,6 +241,15 @@ class AdaptivePlayer:
             if self._first_queue_time is not None:
                 self._startup_delay = time.perf_counter() - self._first_queue_time
             self._start_stream()
+
+    def get_progress(self) -> tuple[int, int]:
+        """Return (samples_played, total_samples_queued) for position tracking.
+
+        Called by PipelineState to compute spoken_pct. The samples_played
+        counter is updated in the audio callback; total_samples_queued is
+        updated in queue_audio(). Both are monotonically increasing.
+        """
+        return self._samples_played, self._total_queued_samples
 
     def wait(self, timeout: float = 120.0) -> PlaybackMetrics:
         """Block until playback finishes. Returns metrics."""
