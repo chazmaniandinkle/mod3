@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import time
-from queue import OutputQueueManager, QueuedJob
+from output_queue import OutputQueueManager, QueuedJob
 from typing import Any, Callable
 
 from modality import (
