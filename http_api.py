@@ -23,7 +23,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from engine import MODELS, generate_audio, get_loaded_engines, resolve_model
-from vad import detect_speech_file, is_hallucination, is_model_loaded as vad_loaded
+from vad import detect_speech_file, is_hallucination
+from vad import is_model_loaded as vad_loaded
 
 app = FastAPI(title="Mod³", description="Local multi-model TTS on Apple Silicon")
 

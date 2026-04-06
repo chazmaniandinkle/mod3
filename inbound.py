@@ -27,7 +27,7 @@ from bus import ModalityBus
 from capture import AudioCapture
 from pipeline_state import PipelineState
 from server import emit_channel_event, emit_permission_verdict
-from vad import detect_speech, VADResult
+from vad import VADResult, detect_speech
 
 # Matches verbal permission verdicts like "yes abcde", "n fghij" (case insensitive).
 # The request_id is 5 lowercase letters (a-z excluding 'l').

@@ -27,15 +27,14 @@ from collections import OrderedDict
 from typing import Any
 
 import anyio
-import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 
 from adaptive_player import AdaptivePlayer
-from engine import MODELS, generate_audio, resolve_model, get_model, get_loaded_engines
-from pipeline_state import PipelineState, InterruptInfo
+from engine import MODELS, generate_audio, get_loaded_engines, get_model, resolve_model
+from pipeline_state import InterruptInfo, PipelineState
 
 logger = logging.getLogger("mod3.server")
 
@@ -437,7 +436,7 @@ def vad_check(file_path: str, threshold: float = 0.5) -> str:
         file_path: Path to a WAV audio file.
         threshold: Speech probability threshold 0-1 (default 0.5). Higher = stricter.
     """
-    from vad import detect_speech_file, is_model_loaded
+    from vad import detect_speech_file
     try:
         result = detect_speech_file(file_path, threshold=threshold)
         return json.dumps({
@@ -551,6 +550,7 @@ def set_output_device(device: str = "") -> str:
 def _run_http(host: str = "0.0.0.0", port: int = 7860):
     """Start the HTTP API server."""
     import uvicorn
+
     from http_api import app
     uvicorn.run(app, host=host, port=port, log_level="info")
 
@@ -580,8 +580,8 @@ if __name__ == "__main__":
     elif args.channel:
         # Channel mode: MCP on stdio + inbound voice pipeline
         from bus import ModalityBus
-        from modules.voice import VoiceModule
         from inbound import InboundPipeline
+        from modules.voice import VoiceModule
 
         bus = ModalityBus()
         bus.register(VoiceModule())

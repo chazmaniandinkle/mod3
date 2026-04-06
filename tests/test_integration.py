@@ -38,8 +38,8 @@ class MockPlayer:
 
 def test_voice_module_instantiates():
     """VoiceModule with WhisperDecoder instantiates without loading models."""
-    from modules.voice import VoiceModule, WhisperDecoder, VoiceGate, VoiceEncoder
     from modality import ModalityType
+    from modules.voice import VoiceEncoder, VoiceGate, VoiceModule, WhisperDecoder
 
     mod = VoiceModule()
     assert mod.modality_type == ModalityType.VOICE, "VoiceModule should be VOICE modality"
@@ -54,8 +54,8 @@ def test_voice_module_instantiates():
 def test_modality_bus_accepts_voice_module():
     """ModalityBus accepts VoiceModule registration and routes correctly."""
     from bus import ModalityBus
-    from modules.voice import VoiceModule
     from modality import ModalityType
+    from modules.voice import VoiceModule
 
     bus = ModalityBus()
     mod = VoiceModule()
@@ -74,7 +74,7 @@ def test_modality_bus_accepts_voice_module():
 
 def test_pipeline_state_interrupt_with_mock_player():
     """PipelineState interrupt() flushes the mock player and returns InterruptInfo."""
-    from pipeline_state import PipelineState, InterruptInfo
+    from pipeline_state import InterruptInfo, PipelineState
 
     state = PipelineState()
     player = MockPlayer()
@@ -152,8 +152,8 @@ def test_audio_capture_instantiates():
 def test_inbound_pipeline_instantiates():
     """InboundPipeline instantiates with bus + pipeline_state without starting."""
     from bus import ModalityBus
-    from modules.voice import VoiceModule
     from capture import AudioCapture
+    from modules.voice import VoiceModule
     from pipeline_state import PipelineState
 
     try:
@@ -180,7 +180,7 @@ def test_inbound_pipeline_instantiates():
 def test_hallucination_filter_patterns():
     """BoH hallucination filter matches known phantom phrases and rejects real speech."""
     try:
-        from vad import is_hallucination, HALLUCINATION_PHRASES
+        from vad import HALLUCINATION_PHRASES, is_hallucination
     except (ImportError, ModuleNotFoundError) as e:
         raise SkipTest(f"vad module unavailable ({e})")
 

@@ -45,7 +45,7 @@ class VoiceGate(Gate):
         self.threshold = threshold
 
     def check(self, raw: bytes, **kwargs) -> GateResult:
-        from vad import detect_speech, is_hallucination
+        from vad import detect_speech
 
         sample_rate = kwargs.get("sample_rate", 16000)
         sample_width = kwargs.get("sample_width", 2)
@@ -105,6 +105,7 @@ class WhisperDecoder(Decoder):
 
     def decode(self, raw: bytes, **kwargs) -> CognitiveEvent:
         import mlx_whisper
+
         from vad import is_hallucination
 
         # Accept a numpy array directly via kwarg, or convert raw bytes.

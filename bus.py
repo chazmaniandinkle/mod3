@@ -21,18 +21,16 @@ from __future__ import annotations
 
 import logging
 import time
+from queue import OutputQueueManager, QueuedJob
 from typing import Any, Callable
 
 from modality import (
     CognitiveEvent,
     CognitiveIntent,
     EncodedOutput,
-    GateResult,
     ModalityModule,
     ModalityType,
-    ModuleState,
 )
-from queue import OutputQueueManager, QueuedJob
 
 logger = logging.getLogger("mod3.bus")
 

@@ -13,7 +13,6 @@ from modality import (
     EncodedOutput,
     Encoder,
     Gate,
-    GateResult,
     ModalityModule,
     ModalityType,
 )
