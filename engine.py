@@ -143,7 +143,7 @@ def generate_audio(
     feather = int(sample_rate * 0.02)
 
     for si, sentence in enumerate(sentences):
-        gen_kwargs = dict(text=sentence, verbose=False)
+        gen_kwargs: dict[str, object] = dict(text=sentence, verbose=False)
         cfg = MODELS[engine]
         if engine == "chatterbox":
             gen_kwargs["exaggeration"] = emotion
