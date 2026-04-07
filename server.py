@@ -23,20 +23,179 @@ import logging
 import threading
 import time
 import uuid
+import wave
 from collections import OrderedDict
 from typing import Any
 
 import anyio
+import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 
-from adaptive_player import AdaptivePlayer
-from engine import MODELS, generate_audio, get_loaded_engines, get_model, resolve_model
+from bus import ModalityBus
+from modality import ModalityType, ModuleStatus
+from modules.voice import PlaceholderDecoder, VoiceModule
 from pipeline_state import InterruptInfo, PipelineState
 
 logger = logging.getLogger("mod3.server")
+
+_MODEL_REGISTRY = {
+    "voxtral": {
+        "id": "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit",
+        "voices": [
+            "casual_male",
+            "casual_female",
+            "cheerful_female",
+            "neutral_male",
+            "neutral_female",
+            "fr_male",
+            "fr_female",
+            "es_male",
+            "es_female",
+            "de_male",
+            "de_female",
+            "it_male",
+            "it_female",
+            "pt_male",
+            "pt_female",
+            "nl_male",
+            "nl_female",
+            "ar_male",
+            "hi_male",
+            "hi_female",
+        ],
+        "default_voice": "casual_male",
+    },
+    "kokoro": {
+        "id": "mlx-community/Kokoro-82M-bf16",
+        "voices": [
+            "af_heart",
+            "af_bella",
+            "af_nicole",
+            "af_sarah",
+            "af_sky",
+            "am_adam",
+            "am_michael",
+            "bf_emma",
+            "bf_isabella",
+            "bm_george",
+            "bm_lewis",
+        ],
+        "default_voice": "af_heart",
+        "supports_speed": True,
+    },
+    "chatterbox": {
+        "id": "mlx-community/chatterbox-4bit",
+        "voices": ["chatterbox"],
+        "default_voice": "chatterbox",
+        "supports_exaggeration": True,
+    },
+    "spark": {
+        "id": "mlx-community/Spark-TTS-0.5B-bf16",
+        "voices": ["spark_male", "spark_female"],
+        "default_voice": "spark_male",
+        "supports_pitch": True,
+        "supports_speed": True,
+    },
+}
+
+
+def _create_bus() -> ModalityBus:
+    bus = ModalityBus()
+    bus.register(VoiceModule(decoder=PlaceholderDecoder()))
+    return bus
+
+
+_bus = _create_bus()
+_bus_vad_lock = threading.Lock()
+
+
+def _get_voice_module() -> VoiceModule | None:
+    module = getattr(_bus, "_modules", {}).get(ModalityType.VOICE)
+    return module if isinstance(module, VoiceModule) else None
+
+
+def _engine_module():
+    import engine
+
+    return engine
+
+
+def _try_engine_module():
+    try:
+        return _engine_module(), None
+    except Exception as exc:
+        return None, exc
+
+
+def _model_registry() -> dict[str, dict[str, Any]]:
+    engine_module, _ = _try_engine_module()
+    return engine_module.MODELS if engine_module is not None else _MODEL_REGISTRY
+
+
+def _adaptive_player_class():
+    from adaptive_player import AdaptivePlayer
+
+    return AdaptivePlayer
+
+
+def _resolve_voice_via_bus(voice: str) -> tuple[str, str]:
+    voice_module = _get_voice_module()
+    if voice_module is None or voice_module.encoder is None:
+        raise ValueError("Voice module is not registered on the ModalityBus.")
+
+    for engine_name, cfg in _model_registry().items():
+        if voice in cfg["voices"]:
+            return engine_name, voice
+
+    raise ValueError(f"Unknown voice '{voice}'. Use list_voices() to see options.")
+
+
+def _read_wav_as_mono_float32(file_path: str) -> tuple[bytes, int]:
+    with wave.open(file_path, "rb") as wav_file:
+        sample_rate = wav_file.getframerate()
+        n_channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width == 2:
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        audio = np.frombuffer(frames, dtype=np.float32)
+
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels).mean(axis=1)
+
+    return audio.astype(np.float32).tobytes(), sample_rate
+
+
+def _set_bus_voice_state(
+    *,
+    status: ModuleStatus,
+    active_job: str | None = None,
+    current_text: str = "",
+    progress: float | None = None,
+    last_output_text: str | None = None,
+    error: str | None = None,
+) -> None:
+    voice_module = _get_voice_module()
+    if voice_module is None:
+        return
+
+    state = voice_module.state
+    state.status = status
+    state.active_job = active_job
+    state.current_text = current_text
+    state.last_activity = time.time()
+    state.error = error
+    if progress is not None:
+        state.progress = progress
+    if last_output_text is not None:
+        state.last_output_text = last_output_text
 
 mcp = FastMCP(
     "mod3",
@@ -224,7 +383,7 @@ MAX_JOBS = 20
 _last_metrics: dict | None = None
 _output_device: int | str | None = None
 _jobs: OrderedDict[str, dict] = OrderedDict()
-_current_player: AdaptivePlayer | None = None
+_current_player: Any | None = None
 _current_player_lock = threading.Lock()
 
 
@@ -249,8 +408,10 @@ def _start_speech(
 ) -> str:
     """Start non-blocking speech generation. Returns job ID immediately."""
     global _last_metrics, _current_player
-    engine, voice = resolve_model(voice)
-    model = get_model(engine)
+    engine_module = _engine_module()
+    AdaptivePlayer = _adaptive_player_class()
+    engine, voice = _resolve_voice_via_bus(voice)
+    model = engine_module.get_model(engine)
     player = AdaptivePlayer(sample_rate=model.sample_rate, device=_output_device)
 
     with _current_player_lock:
@@ -268,12 +429,19 @@ def _start_speech(
         "player": player,
     }
     _prune_jobs()
+    _set_bus_voice_state(
+        status=ModuleStatus.ENCODING,
+        active_job=job_id,
+        current_text=text[:100],
+        progress=0.0,
+        error=None,
+    )
 
     def _run():
         # Register with the reflex arc so inbound VAD can interrupt us
         pipeline_state.start_speaking(text, player)
         try:
-            for chunk in generate_audio(
+            for chunk in engine_module.generate_audio(
                 text,
                 voice=voice,
                 stream=stream,
@@ -282,6 +450,11 @@ def _start_speech(
                 emotion=emotion,
             ):
                 player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
+                _set_bus_voice_state(
+                    status=ModuleStatus.ENCODING,
+                    active_job=job_id,
+                    current_text=text[:100],
+                )
                 # Update position after each chunk so PipelineState tracks progress
                 pipeline_state.update_position(*player.get_progress())
         except Exception as e:
@@ -300,6 +473,14 @@ def _start_speech(
         _jobs[job_id]["metrics"] = result
         _jobs[job_id]["status"] = "error" if _jobs[job_id]["error"] else "done"
         _last_metrics = result
+        _set_bus_voice_state(
+            status=ModuleStatus.ERROR if _jobs[job_id]["error"] else ModuleStatus.IDLE,
+            active_job=None,
+            current_text="",
+            progress=1.0 if not _jobs[job_id]["error"] else 0.0,
+            last_output_text=text[:100],
+            error=_jobs[job_id]["error"],
+        )
 
         with _current_player_lock:
             global _current_player
@@ -469,18 +650,46 @@ def vad_check(file_path: str, threshold: float = 0.5) -> str:
         file_path: Path to a WAV audio file.
         threshold: Speech probability threshold 0-1 (default 0.5). Higher = stricter.
     """
-    from vad import detect_speech_file
-
     try:
-        result = detect_speech_file(file_path, threshold=threshold)
+        voice_module = _get_voice_module()
+        if voice_module is None or voice_module.gate is None:
+            from vad import detect_speech_file
+
+            result = detect_speech_file(file_path, threshold=threshold)
+            return json.dumps(
+                {
+                    "has_speech": result.has_speech,
+                    "confidence": result.confidence,
+                    "speech_ratio": result.speech_ratio,
+                    "num_segments": result.num_segments,
+                    "total_speech_sec": result.total_speech_sec,
+                    "total_audio_sec": result.total_audio_sec,
+                }
+            )
+
+        raw_audio, sample_rate = _read_wav_as_mono_float32(file_path)
+        with _bus_vad_lock:
+            previous_threshold = getattr(voice_module.gate, "threshold", threshold)
+            voice_module.gate.threshold = threshold
+            gate_result = voice_module.gate.check(raw_audio, sample_rate=sample_rate, sample_width=4)
+            _bus.perceive(
+                raw_audio,
+                modality=ModalityType.VOICE,
+                channel="mcp:vad_check",
+                sample_rate=sample_rate,
+                sample_width=4,
+                transcript="speech detected",
+            )
+            voice_module.gate.threshold = previous_threshold
+
         return json.dumps(
             {
-                "has_speech": result.has_speech,
-                "confidence": result.confidence,
-                "speech_ratio": result.speech_ratio,
-                "num_segments": result.num_segments,
-                "total_speech_sec": result.total_speech_sec,
-                "total_audio_sec": result.total_audio_sec,
+                "has_speech": gate_result.passed,
+                "confidence": gate_result.confidence,
+                "speech_ratio": gate_result.metadata.get("speech_ratio", 0.0),
+                "num_segments": gate_result.metadata.get("num_segments", 0),
+                "total_speech_sec": gate_result.metadata.get("total_speech_sec", 0.0),
+                "total_audio_sec": gate_result.metadata.get("total_audio_sec", 0.0),
             }
         )
     except Exception as e:
@@ -497,8 +706,12 @@ def vad_check(file_path: str, threshold: float = 0.5) -> str:
 )
 def list_voices() -> str:
     """List all available voice presets grouped by engine."""
+    if _get_voice_module() is None:
+        logger.warning("list_voices called without a registered bus voice module")
+
+    models = _model_registry()
     lines = []
-    for engine, cfg in MODELS.items():
+    for engine, cfg in models.items():
         extras = []
         if cfg.get("supports_speed"):
             extras.append("speed")
@@ -521,20 +734,29 @@ def list_voices() -> str:
 )
 def diagnostics() -> str:
     """Return engine state and last generation metrics for debugging."""
+    engine_module, engine_error = _try_engine_module()
+    models = engine_module.MODELS if engine_module is not None else _MODEL_REGISTRY
+    loaded_engines = engine_module.get_loaded_engines() if engine_module is not None else []
     engines = {}
-    for name, cfg in MODELS.items():
+    for name, cfg in models.items():
         engines[name] = {
-            "loaded": name in get_loaded_engines() or False,
+            "loaded": name in loaded_engines,
             "model_id": cfg["id"],
             "voices": len(cfg["voices"]),
         }
     info = {
         "engines": engines,
+        "bus": {
+            "health": _bus.health(),
+            "hud": _bus.hud(),
+        },
         "active_jobs": sum(1 for j in _jobs.values() if j["status"] == "speaking"),
         "total_jobs": len(_jobs),
         "output_device": _output_device,
         "last_metrics": _last_metrics,
     }
+    if engine_error is not None:
+        info["engine_import_error"] = str(engine_error)
     return json.dumps(info, indent=2)
 
 

@@ -15,6 +15,7 @@ import io
 import struct
 import time
 import uuid
+import wave
 from collections import OrderedDict
 from threading import Lock
 
@@ -24,13 +25,71 @@ from pydantic import BaseModel, Field
 
 from bus import ModalityBus
 from engine import MODELS, generate_audio, get_loaded_engines, resolve_model
-from modality import EncodedOutput
+from modality import EncodedOutput, ModalityType
 from modules.text import TextModule
 from modules.voice import VoiceModule
 from vad import detect_speech_file, is_hallucination
 from vad import is_model_loaded as vad_loaded
 
 app = FastAPI(title="Mod³", description="Local multi-model TTS on Apple Silicon")
+
+try:
+    from server import _bus as _shared_bus
+except Exception:
+    _shared_bus = ModalityBus()
+
+_bus = _shared_bus
+_bus_vad_lock = Lock()
+
+
+def _ensure_bus_modules() -> None:
+    modules = getattr(_bus, "_modules", {})
+    if ModalityType.TEXT not in modules:
+        _bus.register(TextModule())
+    if ModalityType.VOICE not in modules:
+        _bus.register(VoiceModule())
+
+
+def _get_voice_module() -> VoiceModule | None:
+    module = getattr(_bus, "_modules", {}).get(ModalityType.VOICE)
+    return module if isinstance(module, VoiceModule) else None
+
+
+def _resolve_voice_via_bus(voice: str) -> str:
+    voice_module = _get_voice_module()
+    if voice_module is None or voice_module.encoder is None:
+        raise ValueError("Voice module is not registered on the ModalityBus.")
+
+    for cfg in MODELS.values():
+        if voice in cfg["voices"]:
+            return voice
+
+    raise ValueError(f"Unknown voice '{voice}'. Use /v1/voices to see options.")
+
+
+def _read_wav_as_mono_float32(raw_wav: bytes) -> tuple[bytes, int]:
+    import numpy as np
+
+    with wave.open(io.BytesIO(raw_wav), "rb") as wav_file:
+        sample_rate = wav_file.getframerate()
+        n_channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width == 2:
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        audio = np.frombuffer(frames, dtype=np.float32)
+
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels).mean(axis=1)
+
+    return audio.astype(np.float32).tobytes(), sample_rate
+
+
+_ensure_bus_modules()
 
 # ---------------------------------------------------------------------------
 # Job ledger — full lifecycle tracking for every generation
@@ -138,7 +197,7 @@ def synthesize(req: SynthesizeRequest):
     )
 
     try:
-        resolve_model(req.voice)
+        req.voice = _resolve_voice_via_bus(req.voice)
     except ValueError as e:
         _update_job(job_id, {"status": "error", "error": str(e)})
         return JSONResponse(status_code=400, content={"error": str(e), "job_id": job_id})
@@ -234,7 +293,7 @@ def audio_speech(req: SpeechRequest):
 
     voice = req.voice
     try:
-        resolve_model(voice)
+        voice = _resolve_voice_via_bus(voice)
     except ValueError:
         voice = "af_heart"
 
@@ -316,12 +375,37 @@ async def vad_check(file: UploadFile):
         }
     )
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp.flush()
-        t_load = time.perf_counter()
-        result = detect_speech_file(tmp.name)
+    content = await file.read()
+    t_load = time.perf_counter()
+
+    voice_module = _get_voice_module()
+    if voice_module is not None and voice_module.gate is not None:
+        raw_audio, sample_rate = _read_wav_as_mono_float32(content)
+        with _bus_vad_lock:
+            gate_result = voice_module.gate.check(raw_audio, sample_rate=sample_rate, sample_width=4)
+            _bus.perceive(
+                raw_audio,
+                modality=ModalityType.VOICE,
+                channel="http:v1/vad",
+                sample_rate=sample_rate,
+                sample_width=4,
+                transcript="speech detected",
+            )
+
+        class _Result:
+            has_speech = gate_result.passed
+            confidence = gate_result.confidence
+            speech_ratio = gate_result.metadata.get("speech_ratio", 0.0)
+            num_segments = gate_result.metadata.get("num_segments", 0)
+            total_speech_sec = gate_result.metadata.get("total_speech_sec", 0.0)
+            total_audio_sec = gate_result.metadata.get("total_audio_sec", 0.0)
+
+        result = _Result()
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+            tmp.write(content)
+            tmp.flush()
+            result = detect_speech_file(tmp.name)
 
     t_end = time.perf_counter()
     processing_time = t_end - t_start
@@ -443,13 +527,29 @@ def health():
     }
 
 
+@app.get("/diagnostics")
+def diagnostics():
+    """Diagnostics snapshot with bus state."""
+    with _jobs_lock:
+        total = len(_jobs)
+        active = sum(1 for j in _jobs.values() if j.get("status") in ("generating", "processing"))
+    return {
+        "engines_loaded": get_loaded_engines(),
+        "vad_loaded": vad_loaded(),
+        "jobs": {
+            "total": total,
+            "active": active,
+        },
+        "bus": {
+            "health": _bus.health(),
+            "hud": _bus.hud(),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Modality Bus endpoints
 # ---------------------------------------------------------------------------
-
-_bus = ModalityBus()
-_bus.register(TextModule())
-_bus.register(VoiceModule())
 
 
 @app.get("/v1/bus/hud")
