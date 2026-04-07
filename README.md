@@ -1,8 +1,10 @@
 # Mod³ — Model Modality Modulator
 
-Give your AI agent a voice. Mod³ is an MCP server that runs local TTS models on Apple Silicon, with adaptive buffering, multi-model routing, non-blocking speech, and structured metrics.
+> Part of the [CogOS ecosystem](https://github.com/cogos-dev) — **how it ACTS**
 
-Built for [Claude Code](https://claude.ai/claude-code), works with any MCP-compatible client.
+Mod³ translates between thinking and acting. It's the modality bus for CogOS — the layer where cognitive intents become physical signals and physical signals become cognitive events. Voice is the first modality. The architecture supports any.
+
+Currently: an MCP server that runs local TTS models on Apple Silicon, with adaptive buffering, multi-model routing, non-blocking speech, voice activity detection, and structured metrics. Built for [Claude Code](https://claude.ai/claude-code), works with any MCP-compatible client.
 
 ## What it does
 
