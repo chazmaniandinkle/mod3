@@ -2,7 +2,7 @@
 
 > Part of the [CogOS ecosystem](https://github.com/cogos-dev) — **how it ACTS**
 
-Mod³ translates between thinking and acting. It's the modality bus for CogOS — the layer where cognitive intents become physical signals and physical signals become cognitive events. Voice is the first modality. The architecture supports any.
+Mod³ translates between thinking and acting. It's the modality bus for CogOS — the layer where cognitive intents become physical signals and physical signals become cognitive events. Voice is the first modality. The architecture supports any modality.
 
 Currently: an MCP server that runs local TTS models on Apple Silicon, with adaptive buffering, multi-model routing, non-blocking speech, voice activity detection, and structured metrics. Built for [Claude Code](https://claude.ai/claude-code), works with any MCP-compatible client.
 
@@ -28,7 +28,7 @@ Models are downloaded on first use via HuggingFace Hub.
 ## Quick Start
 
 ```bash
-git clone https://github.com/chazmaniandinkle/mod3.git
+git clone https://github.com/cogos-dev/mod3.git
 cd mod3
 ./setup.sh
 ```
