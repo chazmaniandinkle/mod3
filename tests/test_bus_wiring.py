@@ -70,9 +70,7 @@ def test_bus_health_returns_dict():
     assert isinstance(health, dict), f"health() should return a dict, got {type(health).__name__}"
 
     expected_keys = {"modules", "channels", "queues", "event_count"}
-    assert expected_keys.issubset(health.keys()), (
-        f"health() missing keys: {expected_keys - health.keys()}"
-    )
+    assert expected_keys.issubset(health.keys()), f"health() missing keys: {expected_keys - health.keys()}"
 
     # modules should contain at least 'voice'
     assert "voice" in health["modules"], "health() modules should include 'voice'"
@@ -94,9 +92,7 @@ def test_bus_hud_returns_dict():
     assert isinstance(hud, dict), f"hud() should return a dict, got {type(hud).__name__}"
 
     expected_keys = {"modules", "channels", "queues", "recent_events"}
-    assert expected_keys.issubset(hud.keys()), (
-        f"hud() missing keys: {expected_keys - hud.keys()}"
-    )
+    assert expected_keys.issubset(hud.keys()), f"hud() missing keys: {expected_keys - hud.keys()}"
 
     # modules should contain 'voice' with status info
     assert "voice" in hud["modules"], "hud() modules should include 'voice'"
@@ -161,6 +157,4 @@ def test_http_api_imports_bus():
 
     from bus import ModalityBus
 
-    assert isinstance(http_bus, ModalityBus), (
-        f"http_api._bus should be a ModalityBus, got {type(http_bus).__name__}"
-    )
+    assert isinstance(http_bus, ModalityBus), f"http_api._bus should be a ModalityBus, got {type(http_bus).__name__}"

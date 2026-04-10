@@ -197,6 +197,7 @@ def _set_bus_voice_state(
     if last_output_text is not None:
         state.last_output_text = last_output_text
 
+
 mcp = FastMCP(
     "mod3",
     instructions=(
@@ -514,7 +515,9 @@ def _run_speech_job(entry: dict) -> None:
         _jobs[job_id]["status"] = "error"
         _jobs[job_id]["error"] = str(e)
         _set_bus_voice_state(
-            status=ModuleStatus.ERROR, active_job=None, current_text="",
+            status=ModuleStatus.ERROR,
+            active_job=None,
+            current_text="",
             error=str(e),
         )
         with _current_player_lock:
@@ -616,14 +619,17 @@ def _start_speech(
     }
     _prune_jobs()
 
-    position = _speech_queue.enqueue(job_id, {
-        "text": text,
-        "voice": voice,
-        "stream": stream,
-        "streaming_interval": streaming_interval,
-        "speed": speed,
-        "emotion": emotion,
-    })
+    position = _speech_queue.enqueue(
+        job_id,
+        {
+            "text": text,
+            "voice": voice,
+            "stream": stream,
+            "streaming_interval": streaming_interval,
+            "speed": speed,
+            "emotion": emotion,
+        },
+    )
     return job_id, position
 
 
@@ -637,7 +643,6 @@ def _get_currently_playing_info() -> dict | None:
     with _current_player_lock:
         if _current_player is None:
             return None
-        player = _current_player
 
     active_id = _speech_queue.active_job_id
     if active_id is None:
@@ -721,11 +726,13 @@ def speak(
         qjob = _jobs.get(qid)
         est = qjob.get("estimated_duration_sec", 0.0) if qjob else 0.0
         preview = qjob.get("text", "")[:50] if qjob else entry.get("text", "")[:50]
-        queue_ahead.append({
-            "job_id": qid,
-            "text_preview": preview,
-            "estimated_sec": est,
-        })
+        queue_ahead.append(
+            {
+                "job_id": qid,
+                "text_preview": preview,
+                "estimated_sec": est,
+            }
+        )
 
     # Compute estimated wait: remaining on current + all queued ahead
     wait = currently_playing.get("remaining_sec", 0.0)
@@ -839,11 +846,13 @@ def stop(job_id: str = "") -> str:
         if _speech_queue.cancel(job_id):
             if job_id in _jobs:
                 _jobs[job_id]["status"] = "cancelled"
-            return json.dumps({
-                "status": "ok",
-                "message": f"Cancelled queued job '{job_id}'",
-                "queue_depth": _speech_queue.depth,
-            })
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "message": f"Cancelled queued job '{job_id}'",
+                    "queue_depth": _speech_queue.depth,
+                }
+            )
 
         # Check if it's the currently playing job
         active = _speech_queue.active_job_id
@@ -852,18 +861,22 @@ def stop(job_id: str = "") -> str:
                 player = _current_player
             if player is not None:
                 player.flush()
-            return json.dumps({
-                "status": "ok",
-                "message": f"Interrupted playing job '{job_id}'",
-                "queue_depth": _speech_queue.depth,
-            })
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "message": f"Interrupted playing job '{job_id}'",
+                    "queue_depth": _speech_queue.depth,
+                }
+            )
 
         # Job exists but already done
         if job_id in _jobs:
-            return json.dumps({
-                "status": "ok",
-                "message": f"Job '{job_id}' already finished (status: {_jobs[job_id]['status']})",
-            })
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "message": f"Job '{job_id}' already finished (status: {_jobs[job_id]['status']})",
+                }
+            )
 
         return json.dumps({"status": "error", "error": f"Unknown job '{job_id}'"})
 

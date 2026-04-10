@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from bus import ModalityBus
-from engine import MODELS, generate_audio, get_loaded_engines, resolve_model
+from engine import MODELS, generate_audio, get_loaded_engines
 from modality import EncodedOutput, ModalityType
 from modules.text import TextModule
 from modules.voice import VoiceModule

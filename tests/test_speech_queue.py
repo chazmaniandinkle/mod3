@@ -10,8 +10,6 @@ import sys
 import threading
 import time
 
-import pytest
-
 # Ensure the project root is on the path so imports resolve
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -117,7 +115,6 @@ class TestSpeechQueueDrain:
         q = SpeechQueue()
 
         # Monkey-patch: instead of calling _run_speech_job, record execution
-        original_drain = q._drain
 
         def mock_drain():
             while True:
@@ -148,9 +145,7 @@ class TestSpeechQueueDrain:
         # Wait for drain to process both
         time.sleep(0.2)
 
-        assert execution_order == ["job1", "job2"], (
-            f"Jobs should execute in order, got {execution_order}"
-        )
+        assert execution_order == ["job1", "job2"], f"Jobs should execute in order, got {execution_order}"
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +213,11 @@ class TestStopReturnFormat:
 
         result = json.loads(stop())
         assert result["status"] == "ok"
-        assert "Nothing playing" in result["message"] or "interrupted" in result["message"].lower() or "cancelled" in result["message"].lower()
+        assert (
+            "Nothing playing" in result["message"]
+            or "interrupted" in result["message"].lower()
+            or "cancelled" in result["message"].lower()
+        )
 
     def test_stop_unknown_job_returns_error(self):
         from server import stop
@@ -232,10 +231,9 @@ class TestSpeechStatusReturnFormat:
     """Test that speech_status() returns correctly structured JSON."""
 
     def test_speech_status_no_jobs(self):
-        from server import speech_status
+        from server import _jobs, speech_status
 
         # Clear jobs for this test
-        from server import _jobs
         original = dict(_jobs)
         _jobs.clear()
         try:
