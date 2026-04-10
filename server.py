@@ -394,8 +394,197 @@ def _prune_jobs():
 
 
 # ---------------------------------------------------------------------------
+# Speech queue — serial playback with enriched status
+# ---------------------------------------------------------------------------
+
+
+class SpeechQueue:
+    """Thread-safe queue for serial speech playback.
+
+    When speak() is called while audio is playing, the new request is
+    queued and will play automatically when the current item finishes.
+    All queue operations are protected by a single lock.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._queue: list[dict] = []  # pending jobs (not yet playing)
+        self._active_job_id: str | None = None  # job_id currently playing
+        self._draining = False  # True while the drain thread is running
+
+    def enqueue(self, job_id: str, params: dict) -> int:
+        """Add a job to the queue. Returns the queue position (0 = will play next).
+
+        If nothing is currently playing and the queue is empty, triggers
+        drain immediately so the job starts without delay.
+        """
+        with self._lock:
+            self._queue.append({"job_id": job_id, **params})
+            position = len(self._queue) - 1
+            if not self._draining:
+                self._draining = True
+                threading.Thread(target=self._drain, daemon=True).start()
+            return position
+
+    def cancel(self, job_id: str) -> bool:
+        """Remove a queued (not yet playing) job. Returns True if found and removed."""
+        with self._lock:
+            for i, entry in enumerate(self._queue):
+                if entry["job_id"] == job_id:
+                    self._queue.pop(i)
+                    return True
+        return False
+
+    def cancel_all_queued(self) -> int:
+        """Remove all queued (not yet playing) jobs. Returns count removed."""
+        with self._lock:
+            count = len(self._queue)
+            self._queue.clear()
+            return count
+
+    def get_queue_snapshot(self) -> list[dict]:
+        """Return a snapshot of queued jobs (does not include the active job)."""
+        with self._lock:
+            return list(self._queue)
+
+    @property
+    def active_job_id(self) -> str | None:
+        with self._lock:
+            return self._active_job_id
+
+    @property
+    def depth(self) -> int:
+        """Number of jobs waiting (not including the active one)."""
+        with self._lock:
+            return len(self._queue)
+
+    def _drain(self):
+        """Process queued jobs one at a time until the queue is empty."""
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._draining = False
+                    self._active_job_id = None
+                    return
+                entry = self._queue.pop(0)
+                self._active_job_id = entry["job_id"]
+
+            # Run the speech job (blocking — one at a time)
+            _run_speech_job(entry)
+
+
+_speech_queue = SpeechQueue()
+
+
+# ---------------------------------------------------------------------------
 # Adaptive playback (MCP speaker output)
 # ---------------------------------------------------------------------------
+
+
+def _estimate_duration_sec(text: str, speed: float) -> float:
+    """Rough estimate of speech duration from text length and speed.
+
+    Heuristic: ~150 words per minute at speed 1.0, average word ~5 chars.
+    """
+    words = len(text.split())
+    if words == 0:
+        words = max(1, len(text) / 5)
+    return (words / 150.0) * 60.0 / speed
+
+
+def _run_speech_job(entry: dict) -> None:
+    """Execute a single speech job (blocking). Called from the drain thread."""
+    global _last_metrics, _current_player
+
+    job_id = entry["job_id"]
+    text = entry["text"]
+    voice = entry["voice"]
+    stream = entry.get("stream", True)
+    streaming_interval = entry.get("streaming_interval", 1.0)
+    speed = entry.get("speed", 1.0)
+    emotion = entry.get("emotion", 0.5)
+
+    try:
+        engine_module = _engine_module()
+        AdaptivePlayer = _adaptive_player_class()
+        engine, resolved_voice = _resolve_voice_via_bus(voice)
+        model = engine_module.get_model(engine)
+        player = AdaptivePlayer(sample_rate=model.sample_rate, device=_output_device)
+    except Exception as e:
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["error"] = str(e)
+        _set_bus_voice_state(
+            status=ModuleStatus.ERROR, active_job=None, current_text="",
+            error=str(e),
+        )
+        with _current_player_lock:
+            if _current_player is not None:
+                pass  # leave existing player alone on setup error
+        return
+
+    with _current_player_lock:
+        _current_player = player
+
+    _jobs[job_id]["status"] = "speaking"
+    _jobs[job_id]["start_time"] = time.time()
+    _jobs[job_id]["engine"] = engine
+    _jobs[job_id]["voice"] = resolved_voice
+    _jobs[job_id]["player"] = player
+    _set_bus_voice_state(
+        status=ModuleStatus.ENCODING,
+        active_job=job_id,
+        current_text=text[:100],
+        progress=0.0,
+        error=None,
+    )
+
+    # Register with the reflex arc so inbound VAD can interrupt us
+    pipeline_state.start_speaking(text, player)
+    try:
+        for chunk in engine_module.generate_audio(
+            text,
+            voice=resolved_voice,
+            stream=stream,
+            streaming_interval=streaming_interval,
+            speed=speed,
+            emotion=emotion,
+        ):
+            player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
+            _set_bus_voice_state(
+                status=ModuleStatus.ENCODING,
+                active_job=job_id,
+                current_text=text[:100],
+            )
+            # Update position after each chunk so PipelineState tracks progress
+            pipeline_state.update_position(*player.get_progress())
+    except Exception as e:
+        _jobs[job_id]["error"] = str(e)
+    finally:
+        player.mark_done()
+
+    metrics = player.wait(timeout=120.0)
+    # Final position update and clear speaking state
+    pipeline_state.update_position(*player.get_progress())
+    pipeline_state.stop_speaking()
+
+    result = metrics.to_dict()
+    result["engine"] = engine
+    result["voice"] = resolved_voice
+    _jobs[job_id]["metrics"] = result
+    _jobs[job_id]["status"] = "error" if _jobs[job_id]["error"] else "done"
+    _last_metrics = result
+    _set_bus_voice_state(
+        status=ModuleStatus.ERROR if _jobs[job_id]["error"] else ModuleStatus.IDLE,
+        active_job=None,
+        current_text="",
+        progress=1.0 if not _jobs[job_id]["error"] else 0.0,
+        last_output_text=text[:100],
+        error=_jobs[job_id]["error"],
+    )
+
+    with _current_player_lock:
+        if _current_player is player:
+            _current_player = None
 
 
 def _start_speech(
@@ -405,95 +594,70 @@ def _start_speech(
     streaming_interval: float = 1.0,
     speed: float = 1.0,
     emotion: float = 0.5,
-) -> str:
-    """Start non-blocking speech generation. Returns job ID immediately."""
-    global _last_metrics, _current_player
-    engine_module = _engine_module()
-    AdaptivePlayer = _adaptive_player_class()
-    engine, voice = _resolve_voice_via_bus(voice)
-    model = engine_module.get_model(engine)
-    player = AdaptivePlayer(sample_rate=model.sample_rate, device=_output_device)
+) -> tuple[str, int]:
+    """Submit speech to the queue. Returns (job_id, queue_position).
 
-    with _current_player_lock:
-        _current_player = player
-
+    queue_position is 0 if playing immediately, >0 if queued behind others.
+    """
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {
-        "status": "speaking",
-        "engine": engine,
+        "status": "queued",
+        "engine": None,
         "voice": voice,
         "text": text[:100],
-        "start_time": time.time(),
+        "full_text": text,
+        "submitted_time": time.time(),
+        "start_time": None,
         "metrics": None,
         "error": None,
-        "player": player,
+        "player": None,
+        "speed": speed,
+        "estimated_duration_sec": round(_estimate_duration_sec(text, speed), 1),
     }
     _prune_jobs()
-    _set_bus_voice_state(
-        status=ModuleStatus.ENCODING,
-        active_job=job_id,
-        current_text=text[:100],
-        progress=0.0,
-        error=None,
-    )
 
-    def _run():
-        # Register with the reflex arc so inbound VAD can interrupt us
-        pipeline_state.start_speaking(text, player)
-        try:
-            for chunk in engine_module.generate_audio(
-                text,
-                voice=voice,
-                stream=stream,
-                streaming_interval=streaming_interval,
-                speed=speed,
-                emotion=emotion,
-            ):
-                player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
-                _set_bus_voice_state(
-                    status=ModuleStatus.ENCODING,
-                    active_job=job_id,
-                    current_text=text[:100],
-                )
-                # Update position after each chunk so PipelineState tracks progress
-                pipeline_state.update_position(*player.get_progress())
-        except Exception as e:
-            _jobs[job_id]["error"] = str(e)
-        finally:
-            player.mark_done()
-
-        metrics = player.wait(timeout=120.0)
-        # Final position update and clear speaking state
-        pipeline_state.update_position(*player.get_progress())
-        pipeline_state.stop_speaking()
-
-        result = metrics.to_dict()
-        result["engine"] = engine
-        result["voice"] = voice
-        _jobs[job_id]["metrics"] = result
-        _jobs[job_id]["status"] = "error" if _jobs[job_id]["error"] else "done"
-        _last_metrics = result
-        _set_bus_voice_state(
-            status=ModuleStatus.ERROR if _jobs[job_id]["error"] else ModuleStatus.IDLE,
-            active_job=None,
-            current_text="",
-            progress=1.0 if not _jobs[job_id]["error"] else 0.0,
-            last_output_text=text[:100],
-            error=_jobs[job_id]["error"],
-        )
-
-        with _current_player_lock:
-            global _current_player
-            if _current_player is player:
-                _current_player = None
-
-    threading.Thread(target=_run, daemon=True).start()
-    return job_id
+    position = _speech_queue.enqueue(job_id, {
+        "text": text,
+        "voice": voice,
+        "stream": stream,
+        "streaming_interval": streaming_interval,
+        "speed": speed,
+        "emotion": emotion,
+    })
+    return job_id, position
 
 
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
+
+
+def _get_currently_playing_info() -> dict | None:
+    """Return info about the currently playing job, or None if idle."""
+    with _current_player_lock:
+        if _current_player is None:
+            return None
+        player = _current_player
+
+    active_id = _speech_queue.active_job_id
+    if active_id is None:
+        return None
+
+    job = _jobs.get(active_id)
+    if job is None or job["status"] != "speaking":
+        return None
+
+    start_time = job.get("start_time")
+    elapsed = round(time.time() - start_time, 1) if start_time else 0.0
+    estimated = job.get("estimated_duration_sec", 0.0)
+    remaining = max(0.0, round(estimated - elapsed, 1))
+
+    return {
+        "job_id": active_id,
+        "text_preview": job.get("text", "")[:50],
+        "elapsed_sec": elapsed,
+        "remaining_sec": remaining,
+    }
 
 
 @mcp.tool(
@@ -513,13 +677,13 @@ def speak(
 ) -> str:
     """Synthesize text to speech and play it through the user's speakers.
 
-    Non-blocking: returns immediately with a job ID while audio plays in the
-    background. Use speech_status(id) to check completion and get metrics.
+    Non-blocking: returns immediately with a job ID while audio plays or is
+    queued. If nothing is playing, starts immediately. If audio is already
+    playing, the new request is queued and will play automatically when the
+    current item finishes.
 
-    If speech is already playing, the current output is interrupted and the
-    new text starts immediately. The response includes an "interrupted" field
-    with details about what was playing, so the agent is always aware of the
-    output channel's state without needing a separate status check.
+    The response always includes the current queue state so the agent knows
+    exactly what's happening on the output channel without a separate status call.
 
     Args:
         text: The text to speak aloud. Keep it conversational.
@@ -533,38 +697,59 @@ def speak(
     if not text.strip():
         return json.dumps({"status": "error", "error": "Nothing to say"})
 
-    # Check if something is currently playing and include awareness in response.
-    current_info = None
-    with _current_player_lock:
-        if _current_player is not None:
-            # Find the active job
-            for jid, jdata in reversed(_jobs.items()):
-                if jdata["status"] == "speaking":
-                    elapsed = round(time.time() - jdata["start_time"], 1)
-                    current_info = {
-                        "job_id": jid,
-                        "elapsed_sec": elapsed,
-                        "text_preview": jdata.get("text", "")[:80],
-                    }
-                    break
-
     try:
-        # If something is playing, interrupt it (default: barge-in on self).
-        # This prevents double-output on the same device.
-        if current_info is not None:
-            with _current_player_lock:
-                if _current_player is not None:
-                    _current_player.flush()
-
-        job_id = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)
-        result = {"status": "speaking", "job_id": job_id}
-        if current_info is not None:
-            result["interrupted"] = current_info
-        return json.dumps(result)
+        job_id, position = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)
     except ValueError as e:
         return json.dumps({"status": "error", "error": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)})
+
+    # If position is 0 and nothing else was playing, it starts immediately
+    currently_playing = _get_currently_playing_info()
+
+    if currently_playing is None or currently_playing["job_id"] == job_id:
+        # Playing immediately (no queue ahead)
+        return json.dumps({"status": "speaking", "job_id": job_id})
+
+    # Something is already playing — return enriched queue status
+    queue_snapshot = _speech_queue.get_queue_snapshot()
+    queue_ahead = []
+    for entry in queue_snapshot:
+        qid = entry["job_id"]
+        if qid == job_id:
+            break  # don't include self or anything after self
+        qjob = _jobs.get(qid)
+        est = qjob.get("estimated_duration_sec", 0.0) if qjob else 0.0
+        preview = qjob.get("text", "")[:50] if qjob else entry.get("text", "")[:50]
+        queue_ahead.append({
+            "job_id": qid,
+            "text_preview": preview,
+            "estimated_sec": est,
+        })
+
+    # Compute estimated wait: remaining on current + all queued ahead
+    wait = currently_playing.get("remaining_sec", 0.0)
+    for item in queue_ahead:
+        wait += item.get("estimated_sec", 0.0)
+    wait = round(wait, 1)
+
+    # The queue_position as seen by the user: 1-indexed position in the
+    # overall playback order (1 = next after currently playing)
+    queue_position = len(queue_ahead) + 1
+
+    result = {
+        "status": "queued",
+        "job_id": job_id,
+        "queue_position": queue_position,
+        "currently_playing": currently_playing,
+        "queue_ahead": queue_ahead,
+        "estimated_wait_sec": wait,
+        "actions": (
+            f"To cancel this queued item, call stop(job_id='{job_id}'). "
+            "To cancel all and speak immediately, call stop() then speak()."
+        ),
+    }
+    return json.dumps(result)
 
 
 @mcp.tool(
@@ -578,13 +763,15 @@ def speak(
 def speech_status(job_id: str = "", verbose: bool = False) -> str:
     """Check status of a speech job, or get the most recent result.
 
+    Always includes queue state so the agent has full output channel awareness.
+
     Args:
         job_id: The job ID returned by speak(). If empty, returns the latest job.
         verbose: If True, include per-chunk metrics. Default False (summary only).
     """
     if not job_id:
         if not _jobs:
-            return json.dumps({"status": "idle", "message": "No speech jobs"})
+            return json.dumps({"status": "idle", "message": "No speech jobs", "queue_depth": 0})
         job_id = next(reversed(_jobs))
 
     job = _jobs.get(job_id)
@@ -593,7 +780,16 @@ def speech_status(job_id: str = "", verbose: bool = False) -> str:
 
     result = {"job_id": job_id, "status": job["status"]}
     if job["status"] == "speaking":
-        result["elapsed_sec"] = round(time.time() - job["start_time"], 1)
+        start = job.get("start_time")
+        if start:
+            result["elapsed_sec"] = round(time.time() - start, 1)
+    elif job["status"] == "queued":
+        # Find this job's position in the queue
+        queue_snapshot = _speech_queue.get_queue_snapshot()
+        for i, entry in enumerate(queue_snapshot):
+            if entry["job_id"] == job_id:
+                result["queue_position"] = i + 1
+                break
     if job["metrics"]:
         metrics = job["metrics"]
         if not verbose and "chunks" in metrics:
@@ -610,6 +806,15 @@ def speech_status(job_id: str = "", verbose: bool = False) -> str:
         result["metrics"] = metrics
     if job["error"]:
         result["error"] = job["error"]
+
+    # Always include queue state
+    currently_playing = _get_currently_playing_info()
+    queue_depth = _speech_queue.depth
+    result["queue"] = {
+        "depth": queue_depth,
+        "currently_playing": currently_playing,
+    }
+
     return json.dumps(result)
 
 
@@ -621,15 +826,69 @@ def speech_status(job_id: str = "", verbose: bool = False) -> str:
         "openWorldHint": False,
     }
 )
-def stop() -> str:
-    """Stop current speech playback immediately."""
+def stop(job_id: str = "") -> str:
+    """Stop current speech or cancel a specific queued item.
+
+    Args:
+        job_id: If provided, cancels that specific queued job (not yet playing).
+                If the job_id is the currently playing job, interrupts playback.
+                If empty, interrupts current playback AND clears the entire queue.
+    """
+    if job_id:
+        # Try to cancel a specific queued (not yet playing) job
+        if _speech_queue.cancel(job_id):
+            if job_id in _jobs:
+                _jobs[job_id]["status"] = "cancelled"
+            return json.dumps({
+                "status": "ok",
+                "message": f"Cancelled queued job '{job_id}'",
+                "queue_depth": _speech_queue.depth,
+            })
+
+        # Check if it's the currently playing job
+        active = _speech_queue.active_job_id
+        if active == job_id:
+            with _current_player_lock:
+                player = _current_player
+            if player is not None:
+                player.flush()
+            return json.dumps({
+                "status": "ok",
+                "message": f"Interrupted playing job '{job_id}'",
+                "queue_depth": _speech_queue.depth,
+            })
+
+        # Job exists but already done
+        if job_id in _jobs:
+            return json.dumps({
+                "status": "ok",
+                "message": f"Job '{job_id}' already finished (status: {_jobs[job_id]['status']})",
+            })
+
+        return json.dumps({"status": "error", "error": f"Unknown job '{job_id}'"})
+
+    # No job_id: stop everything — interrupt current + clear queue
+    cleared = _speech_queue.cancel_all_queued()
+    # Mark all cleared queued jobs
+    for jid, jdata in _jobs.items():
+        if jdata["status"] == "queued":
+            jdata["status"] = "cancelled"
+
     with _current_player_lock:
         player = _current_player
-    if player is None:
+    if player is None and cleared == 0:
         return json.dumps({"status": "ok", "message": "Nothing playing"})
 
-    player.flush()
-    return json.dumps({"status": "ok", "message": "Speech interrupted"})
+    if player is not None:
+        player.flush()
+
+    parts = []
+    if player is not None:
+        parts.append("interrupted current playback")
+    if cleared > 0:
+        parts.append(f"cancelled {cleared} queued item{'s' if cleared != 1 else ''}")
+
+    return json.dumps({"status": "ok", "message": "; ".join(parts).capitalize()})
 
 
 @mcp.tool(
@@ -751,7 +1010,9 @@ def diagnostics() -> str:
             "hud": _bus.hud(),
         },
         "active_jobs": sum(1 for j in _jobs.values() if j["status"] == "speaking"),
+        "queued_jobs": sum(1 for j in _jobs.values() if j["status"] == "queued"),
         "total_jobs": len(_jobs),
+        "queue_depth": _speech_queue.depth,
         "output_device": _output_device,
         "last_metrics": _last_metrics,
     }
