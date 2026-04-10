@@ -115,6 +115,8 @@ class ModuleState:
 class Gate(ABC):
     """Input gate — decides if raw input contains signal worth decoding."""
 
+    threshold: float
+
     @abstractmethod
     def check(self, raw: bytes, **kwargs) -> GateResult:
         """Check if this input should pass through to the decoder."""
