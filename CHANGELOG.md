@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Queue-aware speak() returns with enriched metadata (PR #4)
+- SpeechQueue for serial playback (thread-safe)
+- Barge-in file watcher for voice interruption detection
+- User-state detection (held status when user is recording)
+- /v1/stop HTTP endpoint for playback control
+- 18 new tests for queue mechanics
+
+### Fixed
+- Held job zombie drain bug
+- Pyright type errors in Gate abstract class
+- Ruff lint issues (unused imports, variables)
+
 ## [0.3.0] - 2026-04-04
 
 ### Added
