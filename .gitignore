@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .DS_Store
 .claude/
+
+# ONNX Runtime WASM binaries (large, download via setup.sh)
+dashboard/vad/*.wasm
+dashboard/vad/*.mjs
+dashboard/vad/ort.js
+dashboard/vad/ort.min.mjs
