@@ -430,7 +430,7 @@ def auto_detect_provider() -> InferenceProvider:
         return MlxProvider()
 
     try:
-        asyncio.get_running_loop()
+        _loop = asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(auto_detect_provider_async())
 
