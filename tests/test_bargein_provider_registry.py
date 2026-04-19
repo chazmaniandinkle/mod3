@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 
 import pytest
 
@@ -302,6 +303,169 @@ def test_start_from_env_instantiates_known_provider(monkeypatch):
         assert isinstance(registry._providers[0], SuperWhisperProvider)
     finally:
         registry.stop_all(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# wait_for_event — used by await_voice_input() to block until in-process
+# providers fire (replaces the old file-only poll). Regression target for
+# Codex review #4 / Fix 1.
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_event_returns_matching_event():
+    """wait_for_event returns the event when an in-process provider emits it."""
+    registry = BargeinRegistry(PipelineState())
+    p = FakeProvider(on_event=registry._dispatch)
+    registry.register(p)
+    registry.start_all()
+
+    fired = threading.Event()
+    captured: list[BargeinEvent | None] = []
+
+    def _waiter():
+        evt = registry.wait_for_event("user_speaking_end", timeout=2.0)
+        captured.append(evt)
+        fired.set()
+
+    threading.Thread(target=_waiter, daemon=True).start()
+    # Give the waiter a tick to subscribe before we trigger
+    time.sleep(0.05)
+    p.trigger("user_speaking_end", folder="42")
+
+    assert fired.wait(timeout=2.0), "wait_for_event did not return after emit"
+    registry.stop_all()
+    assert len(captured) == 1
+    assert captured[0] is not None
+    assert captured[0].event_type == "user_speaking_end"
+    assert captured[0].metadata == {"folder": "42"}
+
+
+def test_wait_for_event_filters_by_event_type():
+    """A start event must NOT satisfy a wait for end."""
+    registry = BargeinRegistry(PipelineState())
+    p = FakeProvider(on_event=registry._dispatch)
+    registry.register(p)
+    registry.start_all()
+
+    captured: list[BargeinEvent | None] = []
+    done = threading.Event()
+
+    def _waiter():
+        captured.append(registry.wait_for_event("user_speaking_end", timeout=0.4))
+        done.set()
+
+    threading.Thread(target=_waiter, daemon=True).start()
+    time.sleep(0.05)
+    # Wrong event type — the waiter should ignore this and time out
+    p.trigger("user_speaking_start")
+
+    assert done.wait(timeout=2.0)
+    registry.stop_all()
+    assert captured == [None]
+
+
+def test_wait_for_event_filters_by_source():
+    """source=... narrows the wait to a specific provider."""
+    registry = BargeinRegistry(PipelineState())
+    p_browser = FakeProvider(on_event=registry._dispatch)
+
+    # Subclass with a different source value
+    class _SuperFake(FakeProvider):
+        source = "superwhisper"
+
+    p_sw = _SuperFake(on_event=registry._dispatch)
+    registry.register(p_browser)
+    registry.register(p_sw)
+    registry.start_all()
+
+    captured: list[BargeinEvent | None] = []
+    done = threading.Event()
+
+    def _waiter():
+        captured.append(registry.wait_for_event("user_speaking_end", source="superwhisper", timeout=2.0))
+        done.set()
+
+    threading.Thread(target=_waiter, daemon=True).start()
+    time.sleep(0.05)
+    # Browser-VAD end first — should be ignored by source filter
+    p_browser.trigger("user_speaking_end", folder="b1")
+    time.sleep(0.05)
+    # Then SuperWhisper end — should satisfy
+    p_sw.trigger("user_speaking_end", folder="sw1")
+
+    assert done.wait(timeout=2.0)
+    registry.stop_all()
+    assert captured[0] is not None
+    assert captured[0].source == "superwhisper"
+    assert captured[0].metadata == {"folder": "sw1"}
+
+
+def test_wait_for_event_times_out_when_silent():
+    """No event emitted -> wait_for_event returns None within timeout."""
+    registry = BargeinRegistry(PipelineState())
+    t0 = time.monotonic()
+    result = registry.wait_for_event("user_speaking_end", timeout=0.2)
+    elapsed = time.monotonic() - t0
+    assert result is None
+    assert 0.15 < elapsed < 1.0
+
+
+def test_wait_for_event_unsubscribes_on_completion(monkeypatch):
+    """The temporary waiter subscriber must not leak after the wait returns."""
+    registry = BargeinRegistry(PipelineState())
+    p = FakeProvider(on_event=registry._dispatch)
+    registry.register(p)
+    registry.start_all()
+
+    starting = len(registry._subscribers)
+
+    def _do_wait():
+        registry.wait_for_event("user_speaking_end", timeout=0.5)
+
+    t = threading.Thread(target=_do_wait, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    # While waiting, the subscriber count should be elevated
+    assert len(registry._subscribers) == starting + 1
+    p.trigger("user_speaking_end")
+    t.join(timeout=2.0)
+    registry.stop_all()
+    # Cleaned up
+    assert len(registry._subscribers) == starting
+
+
+# ---------------------------------------------------------------------------
+# make_file_mirror_subscriber — bridges in-process events to the legacy
+# /tmp/mod3-barge-in.json signal file so out-of-process pollers (mcp_shim)
+# keep working alongside the new registry.
+# ---------------------------------------------------------------------------
+
+
+def test_file_mirror_subscriber_writes_event_to_path(tmp_path):
+    import json as _json
+
+    from bargein import make_file_mirror_subscriber
+
+    signal_path = str(tmp_path / "mod3-barge-in.json")
+    registry = BargeinRegistry(PipelineState())
+    registry.subscribe(make_file_mirror_subscriber(signal_path))
+
+    p = FakeProvider(on_event=registry._dispatch)
+    registry.register(p)
+    registry.start_all()
+    try:
+        p.trigger("user_speaking_end", folder="abc")
+    finally:
+        registry.stop_all()
+
+    with open(signal_path) as f:
+        written = _json.load(f)
+
+    assert written["event"] == "user_speaking_end"
+    assert written["source"] == "browser_vad"  # FakeProvider's source
+    assert written["folder"] == "abc"
+    assert written["via"] == "bargein_registry"
+    assert "timestamp" in written
 
 
 if __name__ == "__main__":

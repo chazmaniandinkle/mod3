@@ -20,14 +20,16 @@ in ``server.py`` keeps picking up its signals.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 from typing import Callable
 
 from pipeline_state import InterruptInfo, PipelineState
+from schemas.bargein import BargeinSource
 
-from .providers.base import BargeinCallback, BargeinEvent, BargeinProvider
+from .providers.base import BargeinCallback, BargeinEvent, BargeinEventType, BargeinProvider
 
 log = logging.getLogger("bargein")
 
@@ -127,6 +129,57 @@ class BargeinRegistry:
         with self._lock:
             self._subscribers.append(callback)
 
+    def unsubscribe(self, callback: Callable[[BargeinEvent], None]) -> None:
+        """Remove a previously-registered subscriber. Idempotent."""
+        with self._lock:
+            try:
+                self._subscribers.remove(callback)
+            except ValueError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Synchronous wait primitive
+    # ------------------------------------------------------------------
+
+    def wait_for_event(
+        self,
+        event_type: BargeinEventType,
+        source: BargeinSource | None = None,
+        timeout: float | None = None,
+    ) -> BargeinEvent | None:
+        """Block until a matching event is dispatched, or until ``timeout``.
+
+        Returns the matching ``BargeinEvent`` on success, or ``None`` on timeout.
+        Thread-safe; multiple waiters may run concurrently — each receives the
+        first matching event emitted after its wait began.
+
+        Example::
+
+            event = registry.wait_for_event("user_speaking_end", timeout=180)
+            if event is None:
+                ...  # timed out
+        """
+        signal = threading.Event()
+        captured: list[BargeinEvent] = []
+
+        def _waiter(event: BargeinEvent) -> None:
+            if event.event_type != event_type:
+                return
+            if source is not None and event.source != source:
+                return
+            if signal.is_set():
+                return
+            captured.append(event)
+            signal.set()
+
+        self.subscribe(_waiter)
+        try:
+            if signal.wait(timeout):
+                return captured[0]
+            return None
+        finally:
+            self.unsubscribe(_waiter)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -201,10 +254,43 @@ class BargeinRegistry:
                 log.exception("barge-in subscriber raised")
 
 
+def make_file_mirror_subscriber(signal_path: str) -> Callable[[BargeinEvent], None]:
+    """Build a registry subscriber that mirrors events into the legacy signal file.
+
+    The legacy ``/tmp/mod3-barge-in.json`` file is consumed by
+    out-of-process clients (e.g. ``mcp_shim.py``'s ``await_voice_input``)
+    that cannot subscribe to the in-process registry. Installing this
+    subscriber lets in-process providers reach those pollers.
+
+    Writes are atomic (tmp + rename). ``OSError`` is swallowed and logged
+    at debug level — the file mirror is best-effort and must never break
+    in-process delivery.
+    """
+
+    def _mirror(event: BargeinEvent) -> None:
+        try:
+            payload = {
+                "event": event.event_type,
+                "source": event.source,
+                "timestamp": event.timestamp.isoformat(),
+                "via": "bargein_registry",
+                **event.metadata,
+            }
+            tmp = signal_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, signal_path)
+        except OSError:
+            log.debug("file mirror write failed", exc_info=True)
+
+    return _mirror
+
+
 __all__ = [
     "BargeinEvent",
     "BargeinProvider",
     "BargeinRegistry",
     "handle_bargein_start",
+    "make_file_mirror_subscriber",
     "PROVIDER_NAMES",
 ]

@@ -45,7 +45,7 @@ from typing import Optional
 
 import httpx
 
-from bus_bridge import KERNEL_BUS_STREAM_URL, KernelBusSubscriber
+from bus_bridge import KernelBusSubscriber, default_stream_url
 from channels import BrowserChannel
 
 logger = logging.getLogger("mod3.cogos_agent")
@@ -54,9 +54,19 @@ logger = logging.getLogger("mod3.cogos_agent")
 CHAT_BUS_ID = "bus_dashboard_chat"
 RESPONSE_BUS_ID = "bus_dashboard_response"
 
-# Kernel endpoints.
-_DEFAULT_KERNEL_BASE = os.environ.get("COGOS_ENDPOINT", "http://localhost:6931")
-BUS_SEND_URL = f"{_DEFAULT_KERNEL_BASE}/v1/bus/send"
+
+def _kernel_base() -> str:
+    """Resolve the kernel base URL from ``COGOS_ENDPOINT`` at call time."""
+    return os.environ.get("COGOS_ENDPOINT", "http://localhost:6931").rstrip("/")
+
+
+def _bus_send_url() -> str:
+    """Build the kernel bus-send URL from the current ``COGOS_ENDPOINT``."""
+    return f"{_kernel_base()}/v1/bus/send"
+
+
+# Back-compat module attribute. Use ``_bus_send_url()`` for runtime resolution.
+BUS_SEND_URL = _bus_send_url()
 
 # Env gate.
 ENABLE_ENV = "MOD3_USE_COGOS_AGENT"
@@ -97,16 +107,18 @@ async def post_user_message(text: str, session_id: str) -> bool:
         "type": "user_message",
         "message": json.dumps(event, separators=(",", ":")),
     }
+    url = _bus_send_url()
     try:
         async with httpx.AsyncClient(timeout=_POST_TIMEOUT_S) as client:
-            resp = await client.post(BUS_SEND_URL, json=body)
+            resp = await client.post(url, json=body)
     except httpx.HTTPError as exc:
-        logger.warning("cogos-agent: post to %s failed: %s", BUS_SEND_URL, exc)
+        logger.warning("cogos-agent: post to %s failed: %s", url, exc)
         return False
     if resp.status_code // 100 != 2:
         logger.warning(
             "cogos-agent: post non-2xx: %d body=%r",
-            resp.status_code, resp.text[:200],
+            resp.status_code,
+            resp.text[:200],
         )
         return False
     logger.info(
@@ -114,6 +126,36 @@ async def post_user_message(text: str, session_id: str) -> bool:
         session_id,
     )
     return True
+
+
+def _extract_session_id(payload: dict) -> Optional[str]:
+    """Extract the ``session_id`` from a kernel reply payload, if present.
+
+    Mirrors :func:`_extract_response_text`: checks the top-level shape and
+    the JSON-encoded ``content`` wrapper that ``handleBusSend`` produces.
+    Returns ``None`` for older kernels that don't include a session id, or
+    for non-session-scoped events.
+
+    The downstream :meth:`BrowserChannel.broadcast_response_text` falls
+    back to broadcasting when ``session_id`` is ``None``, preserving the
+    backward-compat behavior.
+    """
+    if not isinstance(payload, dict):
+        return None
+    top = payload.get("session_id")
+    if isinstance(top, str) and top:
+        return top
+    content = payload.get("content")
+    if isinstance(content, str) and content:
+        try:
+            inner = json.loads(content)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(inner, dict):
+            sid = inner.get("session_id")
+            if isinstance(sid, str) and sid:
+                return sid
+    return None
 
 
 def _extract_response_text(payload: dict) -> Optional[str]:
@@ -165,21 +207,26 @@ async def run_response_bridge(subscriber: KernelBusSubscriber) -> None:
         if not text:
             logger.debug(
                 "cogos-agent: skip event with no text kind=%s id=%s",
-                env.kind, env.event_id,
+                env.kind,
+                env.event_id,
             )
             continue
         if not first_event_logged:
             logger.info(
                 "cogos-agent: first response forwarded kind=%s event_id=%s",
-                env.kind, env.event_id,
+                env.kind,
+                env.event_id,
             )
             first_event_logged = True
+        session_id = _extract_session_id(env.payload)
         try:
-            BrowserChannel.broadcast_response_text(text)
+            BrowserChannel.broadcast_response_text(text, session_id=session_id)
             forwarded += 1
             logger.debug(
-                "cogos-agent: forwarded response event_id=%s (total=%d)",
-                env.event_id, forwarded,
+                "cogos-agent: forwarded response event_id=%s session=%s (total=%d)",
+                env.event_id,
+                session_id,
+                forwarded,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort fan-out
             logger.debug("cogos-agent: broadcast failed: %s", exc)
@@ -188,11 +235,14 @@ async def run_response_bridge(subscriber: KernelBusSubscriber) -> None:
 async def start_response_bridge(
     app_state: object,
     *,
-    url: str = KERNEL_BUS_STREAM_URL,
+    url: Optional[str] = None,
 ) -> None:
     """Construct the response subscriber + bridge task and store on `app_state`.
 
     No-op (logs once) when `MOD3_USE_COGOS_AGENT` is unset.
+
+    ``url`` defaults to ``COGOS_ENDPOINT`` (resolved at call time) so the
+    subscriber tracks the same kernel endpoint as ``post_user_message``.
     """
     if not is_enabled():
         logger.debug("cogos-agent: response bridge disabled (%s unset)", ENABLE_ENV)
@@ -200,8 +250,9 @@ async def start_response_bridge(
         setattr(app_state, "cogos_agent_task", None)
         return
 
+    resolved_url = url or default_stream_url()
     subscriber = KernelBusSubscriber(
-        url=url,
+        url=resolved_url,
         bus_filter=RESPONSE_BUS_ID,
         consumer_id="mod3-dashboard-agent",
     )
@@ -213,7 +264,8 @@ async def start_response_bridge(
     setattr(app_state, "cogos_agent_task", task)
     logger.info(
         "cogos-agent: response bridge started, target=%s bus_id=%s",
-        url, RESPONSE_BUS_ID,
+        resolved_url,
+        RESPONSE_BUS_ID,
     )
 
 

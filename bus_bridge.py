@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
 
@@ -30,7 +31,26 @@ import httpx
 
 logger = logging.getLogger("mod3.bus_bridge")
 
-KERNEL_BUS_STREAM_URL = "http://localhost:6931/v1/events/stream"
+# Path appended to ``COGOS_ENDPOINT`` (or the default below) to form the
+# kernel SSE stream URL.
+KERNEL_BUS_STREAM_PATH = "/v1/events/stream"
+
+_DEFAULT_KERNEL_BASE = "http://localhost:6931"
+
+
+def default_stream_url() -> str:
+    """Build the kernel bus stream URL from ``COGOS_ENDPOINT`` (or the default).
+
+    Resolved at call time, not at import time, so tests and runtime config
+    can override the env var before the bridge is constructed.
+    """
+    base = os.environ.get("COGOS_ENDPOINT", _DEFAULT_KERNEL_BASE).rstrip("/")
+    return f"{base}{KERNEL_BUS_STREAM_PATH}"
+
+
+# Back-compat module attribute. New code should call ``default_stream_url()``
+# so that ``COGOS_ENDPOINT`` overrides take effect at runtime.
+KERNEL_BUS_STREAM_URL = default_stream_url()
 
 
 @dataclass
@@ -77,7 +97,7 @@ class KernelBusSubscriber:
 
     def __init__(
         self,
-        url: str = KERNEL_BUS_STREAM_URL,
+        url: Optional[str] = None,
         *,
         bus_filter: str = "*",
         consumer_id: Optional[str] = None,
@@ -85,7 +105,10 @@ class KernelBusSubscriber:
         reconnect_max_s: float = 30.0,
         request_timeout_s: float = 10.0,
     ) -> None:
-        self._url = url
+        # ``COGOS_ENDPOINT`` is honored at construction time when ``url`` is
+        # not explicitly provided, so the subscriber tracks whatever endpoint
+        # the rest of the cogos client code is using.
+        self._url = url or default_stream_url()
         self._bus_filter = bus_filter
         self._consumer_id = consumer_id
         self._min_backoff = reconnect_min_s
@@ -136,7 +159,9 @@ class KernelBusSubscriber:
                     if resp.status_code != 200:
                         logger.info(
                             "bus-bridge: non-200 from %s: %s — backing off %.1fs",
-                            self._url, resp.status_code, backoff,
+                            self._url,
+                            resp.status_code,
+                            backoff,
                         )
                         await self._sleep_or_close(backoff)
                         backoff = min(self._max_backoff, max(self._min_backoff, backoff * 2))
@@ -150,7 +175,8 @@ class KernelBusSubscriber:
             except (httpx.HTTPError, asyncio.TimeoutError, ConnectionError) as e:
                 logger.info(
                     "bus-bridge: transport error (%s); reconnecting in %.1fs",
-                    e.__class__.__name__, backoff,
+                    e.__class__.__name__,
+                    backoff,
                 )
                 await self._sleep_or_close(backoff)
                 backoff = min(self._max_backoff, max(self._min_backoff, backoff * 2))
@@ -211,9 +237,7 @@ class KernelBusSubscriber:
                 self._last_event_id = value
             # retry / unknown fields: ignore
 
-    def _parse_event(
-        self, event_name: Optional[str], data: str, event_id: Optional[str]
-    ) -> Optional[BusEnvelope]:
+    def _parse_event(self, event_name: Optional[str], data: str, event_id: Optional[str]) -> Optional[BusEnvelope]:
         try:
             envelope: Any = json.loads(data)
         except json.JSONDecodeError:

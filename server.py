@@ -26,6 +26,7 @@ import time
 import uuid
 import wave
 from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any
 
 import anyio
@@ -369,47 +370,134 @@ _SPEAKING_LOCK = "/tmp/mod3-speaking.json"
 _bargein_last_mtime: float = 0.0
 
 
-def _acquire_speaking_lock(job_id: str, text: str):
-    """Write cross-process speaking lock so the barge-in watcher knows ANY Mod³ is speaking."""
+def _pid_is_alive(pid: Any) -> bool:
+    """Return True if a local process with ``pid`` is still alive."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
-        payload = {
-            "speaking": True,
-            "job_id": job_id,
-            "text": text,
-            "pid": os.getpid(),
-            "timestamp": time.time(),
-        }
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _read_speaking_lock() -> dict | None:
+    """Read the speaking lock file. Returns None if missing or unparseable."""
+    try:
+        if not os.path.exists(_SPEAKING_LOCK):
+            return None
+        with open(_SPEAKING_LOCK) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _acquire_speaking_lock(job_id: str, text: str) -> bool:
+    """Try to claim the cross-process speaking lock for this (pid, job_id).
+
+    The lock is acquired (and overwritten) when:
+      * the file is missing,
+      * the existing holder PID is dead, or
+      * the existing holder is this same (pid, job_id) (idempotent re-acquire).
+
+    Otherwise the lock is left untouched and ``False`` is returned — a
+    different live process owns the speaker. Callers may still play audio
+    locally; they just won't be eligible for cross-process barge-in.
+    """
+    my_pid = os.getpid()
+    payload = {
+        "speaking": True,
+        "job_id": job_id,
+        "text": text,
+        "pid": my_pid,
+        "acquired_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    existing = _read_speaking_lock()
+    if existing is not None:
+        holder_pid = existing.get("pid")
+        holder_job = existing.get("job_id")
+        same_owner = holder_pid == my_pid and holder_job == job_id
+        if not same_owner and _pid_is_alive(holder_pid):
+            return False
+        # Either same owner re-acquiring, or stale lock from a dead pid —
+        # fall through and overwrite.
+
+    try:
         tmp = _SPEAKING_LOCK + ".tmp"
         with open(tmp, "w") as f:
             json.dump(payload, f)
         os.replace(tmp, _SPEAKING_LOCK)
+        return True
     except OSError:
-        pass
+        return False
 
 
-def _release_speaking_lock():
-    """Clear the cross-process speaking lock."""
+def _release_speaking_lock(job_id: str | None = None) -> bool:
+    """Release the speaking lock if this process owns it.
+
+    Returns True if the lock was removed, False if the file is missing,
+    held by a different (pid, job_id), or unreadable. When ``job_id`` is
+    provided, both pid AND job_id must match; otherwise only pid is checked.
+    """
+    existing = _read_speaking_lock()
+    if existing is None:
+        return False
+    if existing.get("pid") != os.getpid():
+        return False
+    if job_id is not None and existing.get("job_id") != job_id:
+        return False
+    try:
+        os.remove(_SPEAKING_LOCK)
+        return True
+    except OSError:
+        return False
+
+
+def _i_own_speaking_lock(job_id: str) -> bool:
+    """True if the on-disk lock matches our (pid, job_id)."""
+    existing = _read_speaking_lock()
+    if existing is None:
+        return False
+    return existing.get("pid") == os.getpid() and existing.get("job_id") == job_id
+
+
+def _force_clear_speaking_lock() -> dict | None:
+    """Forcibly remove the speaking lock regardless of owner.
+
+    Used by the cross-process barge-in path: when the file watcher decides
+    another process must stop speaking, it removes the lock file. The owner
+    notices via stop-on-pid-mismatch (its own pid is no longer present) and
+    halts its generation loop.
+
+    Returns the lock contents at the moment of removal, or ``None`` if the
+    file was missing.
+    """
+    existing = _read_speaking_lock()
     try:
         if os.path.exists(_SPEAKING_LOCK):
             os.remove(_SPEAKING_LOCK)
     except OSError:
         pass
+    return existing
 
 
 def _is_any_process_speaking() -> dict | None:
-    """Check if ANY Mod³ process is currently speaking (cross-process)."""
-    try:
-        if not os.path.exists(_SPEAKING_LOCK):
-            return None
-        with open(_SPEAKING_LOCK) as f:
-            lock = json.load(f)
-        # Stale lock check: if older than 60s, ignore it (crashed process)
-        if time.time() - lock.get("timestamp", 0) > 60:
-            os.remove(_SPEAKING_LOCK)
-            return None
-        return lock
-    except (OSError, json.JSONDecodeError):
+    """Check if a live Mod³ process is currently speaking (cross-process).
+
+    Returns the lock dict if a live holder exists; ``None`` otherwise.
+    Stale locks (holder pid is dead) are removed as a side effect.
+    """
+    existing = _read_speaking_lock()
+    if existing is None:
         return None
+    if not _pid_is_alive(existing.get("pid")):
+        try:
+            os.remove(_SPEAKING_LOCK)
+        except OSError:
+            pass
+        return None
+    return existing
 
 
 def _bargein_watcher():
@@ -468,7 +556,7 @@ def _bargein_watcher():
                                 }
                                 with open(_BARGEIN_SIGNAL, "w") as f:
                                     _json.dump(signal, f, indent=2)
-                                _release_speaking_lock()
+                                _force_clear_speaking_lock()
                                 logging.info(
                                     "Barge-in: cross-process interrupt (pid=%s)",
                                     lock.get("pid"),
@@ -488,9 +576,13 @@ _bargein_thread.start()
 # preserves current behavior for users who only run the legacy file producer.
 # ---------------------------------------------------------------------------
 
-from bargein import BargeinRegistry  # noqa: E402
+from bargein import BargeinRegistry, make_file_mirror_subscriber  # noqa: E402
 
 _bargein_registry = BargeinRegistry(pipeline_state)
+# Mirror in-process provider events into the legacy signal file so
+# out-of-process consumers (mcp_shim.py, integrations watching the file)
+# keep receiving events from in-process providers like SuperWhisperProvider.
+_bargein_registry.subscribe(make_file_mirror_subscriber(_BARGEIN_SIGNAL))
 _bargein_registry.start_from_env()
 
 
@@ -678,7 +770,7 @@ def _run_speech_job(entry: dict) -> None:
 
     # Register with the reflex arc so inbound VAD can interrupt us
     pipeline_state.start_speaking(text, player)
-    _acquire_speaking_lock(job_id, text)
+    i_have_lock = _acquire_speaking_lock(job_id, text)
     try:
         for chunk in engine_module.generate_audio(
             text,
@@ -688,9 +780,15 @@ def _run_speech_job(entry: dict) -> None:
             speed=speed,
             emotion=emotion,
         ):
-            # Check if barge-in cleared our speaking lock (cross-process interrupt)
-            if not os.path.exists(_SPEAKING_LOCK):
-                logging.info("Speaking lock cleared by barge-in watcher — stopping generation")
+            # If we held the cross-process lock and lost it (file gone or
+            # pid no longer matches), the bargein watcher decided we should
+            # stop. Without our own lock, we don't gate on this signal —
+            # another process owns the speaker and we're playing locally.
+            if i_have_lock and not _i_own_speaking_lock(job_id):
+                logging.info(
+                    "Speaking lock no longer ours (job %s) — stopping generation",
+                    job_id,
+                )
                 player.flush()
                 break
             player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
@@ -710,7 +808,7 @@ def _run_speech_job(entry: dict) -> None:
     # Final position update and clear speaking state
     pipeline_state.update_position(*player.get_progress())
     pipeline_state.stop_speaking()
-    _release_speaking_lock()
+    _release_speaking_lock(job_id)
 
     result = metrics.to_dict()
     result["engine"] = engine
@@ -1185,8 +1283,13 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
     when speak() returns "held" (user is recording) or when you want to listen
     for the next voice input.
 
-    Polls the barge-in signal file for user_speaking_end, then reads the
-    transcript from SuperWhisper's recordings directory.
+    Waits on two parallel signal sources, returning when either fires:
+      1. ``BargeinRegistry`` ``user_speaking_end`` events (in-process
+         providers like SuperWhisperProvider).
+      2. The legacy ``/tmp/mod3-barge-in.json`` signal file (standalone
+         producer / cross-process IPC).
+
+    Then reads the transcript from SuperWhisper's recordings directory.
 
     Args:
         timeout_sec: Maximum seconds to wait for recording to finish. Default 180 (3 minutes).
@@ -1196,19 +1299,34 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
     _sw_db = os.path.expanduser("~/Library/Application Support/SuperWhisper/database/superwhisper.sqlite")
     _rec_dir = os.path.expanduser("~/Documents/superwhisper/recordings")
 
-    start = time.time()
-    # If user is currently recording, wait for them to finish
-    while time.time() - start < timeout_sec:
-        try:
-            if os.path.exists(_BARGEIN_SIGNAL):
-                with open(_BARGEIN_SIGNAL) as f:
-                    signal = json.load(f)
-                if signal.get("event") == "user_speaking_end":
-                    break
-        except (OSError, json.JSONDecodeError):
-            pass
-        time.sleep(0.2)
-    else:
+    end_signal = threading.Event()
+
+    def _on_end(event):
+        if event.event_type == "user_speaking_end":
+            end_signal.set()
+
+    _bargein_registry.subscribe(_on_end)
+    try:
+        deadline = time.monotonic() + timeout_sec
+        timed_out = True
+        while time.monotonic() < deadline:
+            try:
+                if os.path.exists(_BARGEIN_SIGNAL):
+                    with open(_BARGEIN_SIGNAL) as f:
+                        signal = json.load(f)
+                    if signal.get("event") == "user_speaking_end":
+                        timed_out = False
+                        break
+            except (OSError, json.JSONDecodeError):
+                pass
+            remaining = max(0.0, deadline - time.monotonic())
+            if end_signal.wait(min(0.2, remaining)):
+                timed_out = False
+                break
+    finally:
+        _bargein_registry.unsubscribe(_on_end)
+
+    if timed_out:
         return json.dumps({"status": "timeout", "error": f"No recording completed within {timeout_sec}s"})
 
     # Recording finished — find the latest transcript
