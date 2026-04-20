@@ -26,6 +26,7 @@ import time
 import uuid
 import wave
 from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any
 
 import anyio
@@ -369,53 +370,156 @@ _SPEAKING_LOCK = "/tmp/mod3-speaking.json"
 _bargein_last_mtime: float = 0.0
 
 
-def _acquire_speaking_lock(job_id: str, text: str):
-    """Write cross-process speaking lock so the barge-in watcher knows ANY Mod³ is speaking."""
+def _pid_is_alive(pid: Any) -> bool:
+    """Return True if a local process with ``pid`` is still alive."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
-        payload = {
-            "speaking": True,
-            "job_id": job_id,
-            "text": text,
-            "pid": os.getpid(),
-            "timestamp": time.time(),
-        }
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _read_speaking_lock() -> dict | None:
+    """Read the speaking lock file. Returns None if missing or unparseable."""
+    try:
+        if not os.path.exists(_SPEAKING_LOCK):
+            return None
+        with open(_SPEAKING_LOCK) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _acquire_speaking_lock(job_id: str, text: str) -> bool:
+    """Try to claim the cross-process speaking lock for this (pid, job_id).
+
+    The lock is acquired (and overwritten) when:
+      * the file is missing,
+      * the existing holder PID is dead, or
+      * the existing holder is this same (pid, job_id) (idempotent re-acquire).
+
+    Otherwise the lock is left untouched and ``False`` is returned — a
+    different live process owns the speaker. Callers may still play audio
+    locally; they just won't be eligible for cross-process barge-in.
+    """
+    my_pid = os.getpid()
+    payload = {
+        "speaking": True,
+        "job_id": job_id,
+        "text": text,
+        "pid": my_pid,
+        "acquired_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    existing = _read_speaking_lock()
+    if existing is not None:
+        holder_pid = existing.get("pid")
+        holder_job = existing.get("job_id")
+        same_owner = holder_pid == my_pid and holder_job == job_id
+        if not same_owner and _pid_is_alive(holder_pid):
+            return False
+        # Either same owner re-acquiring, or stale lock from a dead pid —
+        # fall through and overwrite.
+
+    try:
         tmp = _SPEAKING_LOCK + ".tmp"
         with open(tmp, "w") as f:
             json.dump(payload, f)
         os.replace(tmp, _SPEAKING_LOCK)
+        return True
     except OSError:
-        pass
+        return False
 
 
-def _release_speaking_lock():
-    """Clear the cross-process speaking lock."""
+def _release_speaking_lock(job_id: str | None = None) -> bool:
+    """Release the speaking lock if this process owns it.
+
+    Returns True if the lock was removed, False if the file is missing,
+    held by a different (pid, job_id), or unreadable. When ``job_id`` is
+    provided, both pid AND job_id must match; otherwise only pid is checked.
+    """
+    existing = _read_speaking_lock()
+    if existing is None:
+        return False
+    if existing.get("pid") != os.getpid():
+        return False
+    if job_id is not None and existing.get("job_id") != job_id:
+        return False
+    try:
+        os.remove(_SPEAKING_LOCK)
+        return True
+    except OSError:
+        return False
+
+
+def _i_own_speaking_lock(job_id: str) -> bool:
+    """True if the on-disk lock matches our (pid, job_id)."""
+    existing = _read_speaking_lock()
+    if existing is None:
+        return False
+    return existing.get("pid") == os.getpid() and existing.get("job_id") == job_id
+
+
+def _force_clear_speaking_lock() -> dict | None:
+    """Forcibly remove the speaking lock regardless of owner.
+
+    Used by the cross-process barge-in path: when the file watcher decides
+    another process must stop speaking, it removes the lock file. The owner
+    notices via stop-on-pid-mismatch (its own pid is no longer present) and
+    halts its generation loop.
+
+    Returns the lock contents at the moment of removal, or ``None`` if the
+    file was missing.
+    """
+    existing = _read_speaking_lock()
     try:
         if os.path.exists(_SPEAKING_LOCK):
             os.remove(_SPEAKING_LOCK)
     except OSError:
         pass
+    return existing
 
 
 def _is_any_process_speaking() -> dict | None:
-    """Check if ANY Mod³ process is currently speaking (cross-process)."""
-    try:
-        if not os.path.exists(_SPEAKING_LOCK):
-            return None
-        with open(_SPEAKING_LOCK) as f:
-            lock = json.load(f)
-        # Stale lock check: if older than 60s, ignore it (crashed process)
-        if time.time() - lock.get("timestamp", 0) > 60:
-            os.remove(_SPEAKING_LOCK)
-            return None
-        return lock
-    except (OSError, json.JSONDecodeError):
+    """Check if a live Mod³ process is currently speaking (cross-process).
+
+    Returns the lock dict if a live holder exists; ``None`` otherwise.
+    Stale locks (holder pid is dead) are removed as a side effect.
+    """
+    existing = _read_speaking_lock()
+    if existing is None:
         return None
+    if not _pid_is_alive(existing.get("pid")):
+        try:
+            os.remove(_SPEAKING_LOCK)
+        except OSError:
+            pass
+        return None
+    return existing
 
 
 def _bargein_watcher():
-    """Background thread that watches for barge-in signal file changes."""
+    """Background thread that watches for barge-in signal file changes.
+
+    This path is retained for the standalone ``integrations/bargein-producer.py``
+    producer (and its launchd plist). In-process providers go through
+    ``bargein.BargeinRegistry`` instead, calling the same shared
+    ``handle_bargein_start`` consumer helper.
+
+    For ``user_speaking_end`` events, the watcher also bridges the file into
+    the registry by dispatching a synthetic ``BargeinEvent`` — that lets
+    registry-side waiters (``await_voice_input``'s ``wait_for_event``) wake
+    from file-based producers without maintaining a second wait path.
+    Feedback is broken by skipping files whose ``via`` marker shows they were
+    written by our own file-mirror subscriber.
+    """
     global _bargein_last_mtime
     import json as _json
+
+    from bargein import handle_bargein_start
+    from bargein.providers.base import BargeinEvent
 
     while True:
         try:
@@ -427,30 +531,50 @@ def _bargein_watcher():
                     _bargein_last_mtime = mtime
                     with open(_BARGEIN_SIGNAL) as f:
                         signal = _json.load(f)
-                    if signal.get("event") == "user_speaking_start":
-                        # Check local pipeline state first (same process)
-                        if pipeline_state.is_speaking:
-                            info = pipeline_state.interrupt(reason="barge_in")
-                            if info:
-                                signal["interrupted"] = {
-                                    "spoken_pct": info.spoken_pct,
-                                    "delivered_text": info.delivered_text,
-                                    "full_text": info.full_text,
-                                }
-                                with open(_BARGEIN_SIGNAL, "w") as f:
-                                    _json.dump(signal, f, indent=2)
-                            logging.info(
-                                "Barge-in: paused local playback (%.0f%% delivered)",
-                                info.spoken_pct * 100 if info else 0,
+                    event_type = signal.get("event")
+                    # Break the file_mirror → watcher → registry feedback loop:
+                    # events the registry itself just mirrored out are marked
+                    # with via=bargein_registry and should not round-trip back.
+                    from_mirror = signal.get("via") == "bargein_registry"
+                    if event_type == "user_speaking_end" and not from_mirror:
+                        # Bridge external producers (integrations/bargein-producer.py)
+                        # into the in-process registry so wait_for_event sees them.
+                        _bargein_registry._dispatch(
+                            BargeinEvent(
+                                source=signal.get("source", "superwhisper"),
+                                event_type="user_speaking_end",
+                                metadata={
+                                    "via": "file_signal",
+                                    **{k: v for k, v in signal.items() if k not in ("event", "source", "timestamp")},
+                                },
                             )
+                        )
+                    if signal.get("event") == "user_speaking_start":
+                        # Shared consumer: check is_speaking + interrupt + log
+                        info = handle_bargein_start(
+                            pipeline_state,
+                            source=signal.get("source", "file_signal"),
+                            metadata={"via": "file_signal"},
+                        )
+                        if info is not None:
+                            # Enrich the on-disk signal so cooperating consumers
+                            # can read the interrupt detail.
+                            signal["interrupted"] = {
+                                "spoken_pct": info.spoken_pct,
+                                "delivered_text": info.delivered_text,
+                                "full_text": info.full_text,
+                            }
+                            with open(_BARGEIN_SIGNAL, "w") as f:
+                                _json.dump(signal, f, indent=2)
                         else:
-                            # Check cross-process lock (another Mod³ process may be speaking)
+                            # Nothing speaking locally — check cross-process lock.
+                            # This path is only meaningful for the file-based IPC
+                            # (another mod3 process owns the speech); in-process
+                            # providers share pipeline_state so never land here.
                             lock = _is_any_process_speaking()
                             if lock:
-                                # We can't interrupt another process's pipeline_state,
-                                # but we CAN write the interrupt context from the lock data
                                 signal["interrupted"] = {
-                                    "spoken_pct": 0.0,  # Unknown from cross-process
+                                    "spoken_pct": 0.0,
                                     "delivered_text": "",
                                     "full_text": lock.get("text", ""),
                                     "cross_process": True,
@@ -458,13 +582,33 @@ def _bargein_watcher():
                                 }
                                 with open(_BARGEIN_SIGNAL, "w") as f:
                                     _json.dump(signal, f, indent=2)
-                                # Clear the speaking lock to signal the other process
-                                _release_speaking_lock()
-                                logging.info("Barge-in: cross-process interrupt (pid=%s)", lock.get("pid"))
+                                _force_clear_speaking_lock()
+                                logging.info(
+                                    "Barge-in: cross-process interrupt (pid=%s)",
+                                    lock.get("pid"),
+                                )
         except Exception as e:
             logging.debug("Barge-in watcher error: %s", e)
         time.sleep(0.1)  # 100ms poll
 
+
+# ---------------------------------------------------------------------------
+# Barge-in provider registry — in-process providers (SuperWhisper, future:
+# silero VAD, hotkey, etc.). Opt-in via MOD3_BARGEIN_PROVIDERS. Empty default
+# preserves current behavior for users who only run the legacy file producer.
+#
+# NOTE: the registry is constructed BEFORE the watcher thread starts because
+# the watcher bridges file user_speaking_end events into the registry.
+# ---------------------------------------------------------------------------
+
+from bargein import BargeinRegistry, make_file_mirror_subscriber  # noqa: E402
+
+_bargein_registry = BargeinRegistry(pipeline_state)
+# Mirror in-process provider events into the legacy signal file so
+# out-of-process consumers (mcp_shim.py, integrations watching the file)
+# keep receiving events from in-process providers like SuperWhisperProvider.
+_bargein_registry.subscribe(make_file_mirror_subscriber(_BARGEIN_SIGNAL))
+_bargein_registry.start_from_env()
 
 _bargein_thread = threading.Thread(target=_bargein_watcher, daemon=True)
 _bargein_thread.start()
@@ -654,7 +798,7 @@ def _run_speech_job(entry: dict) -> None:
 
     # Register with the reflex arc so inbound VAD can interrupt us
     pipeline_state.start_speaking(text, player)
-    _acquire_speaking_lock(job_id, text)
+    i_have_lock = _acquire_speaking_lock(job_id, text)
     try:
         for chunk in engine_module.generate_audio(
             text,
@@ -664,9 +808,15 @@ def _run_speech_job(entry: dict) -> None:
             speed=speed,
             emotion=emotion,
         ):
-            # Check if barge-in cleared our speaking lock (cross-process interrupt)
-            if not os.path.exists(_SPEAKING_LOCK):
-                logging.info("Speaking lock cleared by barge-in watcher — stopping generation")
+            # If we held the cross-process lock and lost it (file gone or
+            # pid no longer matches), the bargein watcher decided we should
+            # stop. Without our own lock, we don't gate on this signal —
+            # another process owns the speaker and we're playing locally.
+            if i_have_lock and not _i_own_speaking_lock(job_id):
+                logging.info(
+                    "Speaking lock no longer ours (job %s) — stopping generation",
+                    job_id,
+                )
                 player.flush()
                 break
             player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
@@ -686,7 +836,7 @@ def _run_speech_job(entry: dict) -> None:
     # Final position update and clear speaking state
     pipeline_state.update_position(*player.get_progress())
     pipeline_state.stop_speaking()
-    _release_speaking_lock()
+    _release_speaking_lock(job_id)
 
     result = metrics.to_dict()
     result["engine"] = engine
@@ -1161,8 +1311,14 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
     when speak() returns "held" (user is recording) or when you want to listen
     for the next voice input.
 
-    Polls the barge-in signal file for user_speaking_end, then reads the
-    transcript from SuperWhisper's recordings directory.
+    Single wait path: ``BargeinRegistry.wait_for_event("user_speaking_end", ...)``.
+    Out-of-process producers (``integrations/bargein-producer.py``) write to
+    ``/tmp/mod3-barge-in.json``; the module-level ``_bargein_watcher`` bridges
+    those writes into the registry as synthetic events, so both in-process
+    and out-of-process sources funnel through one wait.
+
+    After the wait unblocks, reads the transcript from SuperWhisper's
+    recordings directory (meta.json) or SQLite DB as a fallback.
 
     Args:
         timeout_sec: Maximum seconds to wait for recording to finish. Default 180 (3 minutes).
@@ -1172,19 +1328,8 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
     _sw_db = os.path.expanduser("~/Library/Application Support/SuperWhisper/database/superwhisper.sqlite")
     _rec_dir = os.path.expanduser("~/Documents/superwhisper/recordings")
 
-    start = time.time()
-    # If user is currently recording, wait for them to finish
-    while time.time() - start < timeout_sec:
-        try:
-            if os.path.exists(_BARGEIN_SIGNAL):
-                with open(_BARGEIN_SIGNAL) as f:
-                    signal = json.load(f)
-                if signal.get("event") == "user_speaking_end":
-                    break
-        except (OSError, json.JSONDecodeError):
-            pass
-        time.sleep(0.2)
-    else:
+    event = _bargein_registry.wait_for_event("user_speaking_end", timeout=timeout_sec)
+    if event is None:
         return json.dumps({"status": "timeout", "error": f"No recording completed within {timeout_sec}s"})
 
     # Recording finished — find the latest transcript
