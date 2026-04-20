@@ -22,7 +22,6 @@ import time
 import wave
 from pathlib import Path
 
-import httpx
 from websockets.client import connect as ws_connect
 
 HERE = Path(__file__).resolve().parent
