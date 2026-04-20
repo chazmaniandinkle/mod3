@@ -198,18 +198,11 @@ class AgentLoop:
             pending = self._pending_bargein
             if pending is not None:
                 self._pending_bargein = None
-                forwarded_text = (
-                    "[interrupted earlier] "
-                    + pending.format_for_prompt()
-                    + "\n"
-                    + forwarded_text
-                )
+                forwarded_text = "[interrupted earlier] " + pending.format_for_prompt() + "\n" + forwarded_text
             ok = await _post_user_message(forwarded_text, session_id=session_id)
             if not ok and self._channel_ref:
                 try:
-                    await self._channel_ref.send_response_text(
-                        "[cogos-agent unreachable — check kernel]"
-                    )
+                    await self._channel_ref.send_response_text("[cogos-agent unreachable — check kernel]")
                     await self._channel_ref.send_response_complete(
                         metrics={"provider": "cogos-agent", "error": "unreachable"}
                     )

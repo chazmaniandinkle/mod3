@@ -31,8 +31,14 @@ from bus_bridge import KernelBusSubscriber  # noqa: E402
 WS_URL = "ws://localhost:7860/ws/chat"
 KERNEL_STREAM = "http://localhost:6931/v1/events/stream"
 TTS_OUT = Path("/tmp/mod3-harness-tts.wav")
-RESULT: dict = {"response_text": [], "audio_frames": 0, "audio_bytes": 0,
-                "trace_events": [], "interrupt_sent": False, "started": time.time()}
+RESULT: dict = {
+    "response_text": [],
+    "audio_frames": 0,
+    "audio_bytes": 0,
+    "trace_events": [],
+    "interrupt_sent": False,
+    "started": time.time(),
+}
 
 
 async def subscribe_trace(seconds: float) -> None:
@@ -118,10 +124,12 @@ async def run_dashboard_session(interrupt_after_s: float, text: str) -> None:
                 got_done = True
                 done_ts = time.time()
             elif t == "trace_event":
-                RESULT["trace_events"].append({
-                    "kind": (frame.get("event") or {}).get("kind", "?"),
-                    "ts": (frame.get("event") or {}).get("ts"),
-                })
+                RESULT["trace_events"].append(
+                    {
+                        "kind": (frame.get("event") or {}).get("kind", "?"),
+                        "ts": (frame.get("event") or {}).get("ts"),
+                    }
+                )
             if RESULT["audio_frames"] >= 2 and RESULT["interrupt_sent"] is False:
                 await deferred_interrupt()
                 break
@@ -137,15 +145,13 @@ async def run_dashboard_session(interrupt_after_s: float, text: str) -> None:
 
 
 async def main() -> int:
-    text = os.environ.get("HARNESS_PROMPT",
-                          "In one short sentence, describe the planet Jupiter.")
+    text = os.environ.get("HARNESS_PROMPT", "In one short sentence, describe the planet Jupiter.")
     skip_interrupt = os.environ.get("HARNESS_SKIP_INTERRUPT") == "1"
     trace_task = asyncio.create_task(subscribe_trace(seconds=45.0))
     try:
         await asyncio.wait_for(
-            run_dashboard_session(interrupt_after_s=9999 if skip_interrupt else 2.5,
-                                  text=text),
-            timeout=90.0)
+            run_dashboard_session(interrupt_after_s=9999 if skip_interrupt else 2.5, text=text), timeout=90.0
+        )
     except asyncio.TimeoutError:
         print("[warn] dashboard session timed out")
     await asyncio.sleep(1.5)
@@ -161,13 +167,15 @@ async def main() -> int:
     if RESULT["response_text"]:
         joined = " ".join(RESULT["response_text"])[:400]
         print(f"  preview: {joined!r}")
-    print(f"audio frames: {RESULT['audio_frames']}  wav path: {RESULT.get('tts_wav_path','-')}  sr={RESULT.get('tts_wav_sr','-')}")
+    print(
+        f"audio frames: {RESULT['audio_frames']}  wav path: {RESULT.get('tts_wav_path', '-')}  sr={RESULT.get('tts_wav_sr', '-')}"
+    )
     print(f"interrupt_sent: {RESULT['interrupt_sent']}")
-    print(f"trace events observed: {len(RESULT['trace_events'])}  kinds: {sorted({e['kind'] for e in RESULT['trace_events']})}")
+    print(
+        f"trace events observed: {len(RESULT['trace_events'])}  kinds: {sorted({e['kind'] for e in RESULT['trace_events']})}"
+    )
 
-    ok = (len(RESULT["response_text"]) > 0 and
-          RESULT["audio_frames"] > 0 and
-          len(RESULT["trace_events"]) > 0)
+    ok = len(RESULT["response_text"]) > 0 and RESULT["audio_frames"] > 0 and len(RESULT["trace_events"]) > 0
     return 0 if ok else 1
 
 

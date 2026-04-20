@@ -482,7 +482,7 @@ class BrowserChannel:
         frame = {"type": "response_text", "text": text}
         expected_channel = None
         if session_id and session_id.startswith("mod3:"):
-            expected_channel = session_id[len("mod3:"):]
+            expected_channel = session_id[len("mod3:") :]
         for ch in list(cls._active_channels):
             if not ch._active:
                 continue

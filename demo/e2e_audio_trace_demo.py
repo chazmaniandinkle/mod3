@@ -12,6 +12,7 @@ Exit 1 with a clear error otherwise.
 Usage:
     python3 demo/e2e_audio_trace_demo.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -77,6 +78,7 @@ async def collect() -> int:
 
     print(f"[..] subscribing to {sub._url} bus={BUS} (up to {MAX_WAIT_S}s or {TARGET_EVENTS} events)")
     try:
+
         async def _run():
             nonlocal first_ts, last_ts
             async for env in sub.stream():
@@ -99,7 +101,9 @@ async def collect() -> int:
                     first_ts = first_ts or ts
                     last_ts = ts
                 captured.append(inner)
-                print(f"[evt] kind={kind} cycle_id={cid} ts={ts} payload_keys={sorted((inner.get('payload') or {}).keys())[:6]}")
+                print(
+                    f"[evt] kind={kind} cycle_id={cid} ts={ts} payload_keys={sorted((inner.get('payload') or {}).keys())[:6]}"
+                )
                 if len(captured) >= TARGET_EVENTS:
                     return
 
