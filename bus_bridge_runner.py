@@ -24,7 +24,7 @@ import logging
 import os
 from typing import Optional
 
-from bus_bridge import KERNEL_BUS_STREAM_URL, BusEnvelope, KernelBusSubscriber
+from bus_bridge import KernelBusSubscriber, default_stream_url
 from channels import BrowserChannel
 
 logger = logging.getLogger("mod3.bus_bridge")
@@ -75,7 +75,8 @@ async def run_bridge(
         if not first_event_logged:
             logger.info(
                 "bridge: first event forwarded kind=%s event_id=%s",
-                env.kind, env.event_id,
+                env.kind,
+                env.event_id,
             )
             first_event_logged = True
         try:
@@ -83,7 +84,9 @@ async def run_bridge(
             forwarded += 1
             logger.debug(
                 "bridge: forwarded kind=%s event_id=%s (total=%d)",
-                env.kind, env.event_id, forwarded,
+                env.kind,
+                env.event_id,
+                forwarded,
             )
         except Exception as exc:  # noqa: BLE001 — broadcaster is best-effort
             logger.debug("bridge: broadcast failed: %s", exc)
@@ -92,7 +95,7 @@ async def run_bridge(
 async def start_bridge(
     app_state: object,
     *,
-    url: str = KERNEL_BUS_STREAM_URL,
+    url: Optional[str] = None,
     bus_filter: str = TRACE_BUS_ID,
     filter_kinds: Optional[set[str]] = frozenset(ADR083_KINDS),
 ) -> None:
@@ -101,6 +104,10 @@ async def start_bridge(
     Startup is non-blocking: we don't await the task or probe the kernel.
     The subscriber's own backoff loop handles reconnects. Logs a disabled
     notice and returns cleanly when `MOD3_BUS_BRIDGE_DISABLED` is set.
+
+    ``url`` defaults to ``COGOS_ENDPOINT`` (resolved at call time) so the
+    subscriber tracks whatever endpoint the rest of the cogos client code is
+    using.
     """
     if is_disabled():
         logger.info("bridge: disabled via %s=1", DISABLE_ENV)
@@ -108,7 +115,8 @@ async def start_bridge(
         setattr(app_state, "bus_bridge_task", None)
         return
 
-    subscriber = KernelBusSubscriber(url=url, bus_filter=bus_filter, consumer_id="mod3-dashboard")
+    resolved_url = url or default_stream_url()
+    subscriber = KernelBusSubscriber(url=resolved_url, bus_filter=bus_filter, consumer_id="mod3-dashboard")
     task = asyncio.create_task(
         run_bridge(subscriber, filter_kinds=set(filter_kinds) if filter_kinds else None),
         name="mod3-bus-bridge",
@@ -117,7 +125,9 @@ async def start_bridge(
     setattr(app_state, "bus_bridge_task", task)
     logger.info(
         "bridge: started, target=%s bus_id=%s filter=%s",
-        url, bus_filter, sorted(filter_kinds) if filter_kinds else "*",
+        resolved_url,
+        bus_filter,
+        sorted(filter_kinds) if filter_kinds else "*",
     )
 
 

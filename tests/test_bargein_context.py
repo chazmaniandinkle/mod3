@@ -18,8 +18,6 @@ import sys
 import time
 from unittest.mock import MagicMock
 
-import pytest
-
 # Ensure the project root is on sys.path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,7 +26,6 @@ from modality import CognitiveEvent, ModalityType  # noqa: E402
 from pipeline_state import InterruptInfo, PipelineState  # noqa: E402
 from providers import ProviderResponse  # noqa: E402
 from schemas.bargein import BargeinContext  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # Test doubles
