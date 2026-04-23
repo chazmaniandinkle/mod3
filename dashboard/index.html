@@ -1045,10 +1045,11 @@ chatInput.addEventListener('input', () => {
       try { await ctx.resume(); } catch { /* user-gesture required */ }
     }
     try {
-      // decodeAudioData wants an ArrayBuffer (not a shared view). Make a copy
-      // to be safe across browsers.
+      // decodeAudioData wants an ArrayBuffer (not a typed-array view). Make
+      // an ArrayBuffer copy in both branches — Uint8Array.slice returns a
+      // Uint8Array, not an ArrayBuffer, which fails decodeAudioData.
       const copy = buffer.byteLength === buffer.buffer.byteLength
-        ? buffer.slice(0) : buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+        ? buffer.buffer.slice(0) : buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
       const decoded = await ctx.decodeAudioData(copy);
       const src = ctx.createBufferSource();
       src.buffer = decoded;
