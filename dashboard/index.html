@@ -1000,6 +1000,145 @@ chatInput.addEventListener('input', () => {
     setInterval(pollSessions, POLL_INTERVAL_MS);
   });
 })();
+
+/**
+ * Wave 4.3 — Per-session audio WebSocket.
+ *
+ * After the session registers, open ``/ws/audio/{session_id}`` and play
+ * inbound WAV blobs through a Web Audio context. The contract from the
+ * server is:
+ *
+ *   1. JSON text frame: {type: "audio_header", session_id, job_id,
+ *      duration_sec, sample_rate, bytes, format: "wav", seq}
+ *   2. Binary frame: raw WAV bytes.
+ *
+ * We pair them up, decode via AudioContext.decodeAudioData, and play.
+ * Chunking is explicitly whole-blob for v1 — decodeAudioData wants a
+ * complete WAV. A future revision can stream PCM through an AudioWorklet
+ * for lower latency; the header envelope is the forward-compatibility
+ * seam.
+ *
+ * Reconnect: on close, reconnect with exponential backoff up to 30s. The
+ * kernel's subscriber-check runs on every synthesize so a transient gap
+ * just means one turn plays through afplay — the next turn lands back in
+ * the browser.
+ */
+(function setupAudioSubscription() {
+  let ws = null;
+  let audioCtx = null;
+  let reconnectDelay = 1000;
+  let currentSessionId = null;
+  let pendingHeader = null;  // last JSON header waiting for its binary pair
+
+  function ensureAudioCtx() {
+    if (audioCtx) return audioCtx;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) { console.error('[AudioWS] Web Audio API unavailable'); return null; }
+    audioCtx = new Ctor();
+    return audioCtx;
+  }
+
+  async function playWavBlob(buffer, header) {
+    const ctx = ensureAudioCtx();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      try { await ctx.resume(); } catch { /* user-gesture required */ }
+    }
+    try {
+      // decodeAudioData wants an ArrayBuffer (not a shared view). Make a copy
+      // to be safe across browsers.
+      const copy = buffer.byteLength === buffer.buffer.byteLength
+        ? buffer.slice(0) : buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+      const decoded = await ctx.decodeAudioData(copy);
+      const src = ctx.createBufferSource();
+      src.buffer = decoded;
+      src.connect(ctx.destination);
+      src.start();
+      console.log('[AudioWS] Playing',
+        header ? `job=${header.job_id} dur=${header.duration_sec}s sr=${header.sample_rate}` : '',
+        `samples=${decoded.length}`);
+    } catch (err) {
+      console.error('[AudioWS] decodeAudioData failed:', err);
+    }
+  }
+
+  function connect(sessionId) {
+    if (!sessionId) return;
+    currentSessionId = sessionId;
+    const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${scheme}//${window.location.host}/ws/audio/${encodeURIComponent(sessionId)}`;
+    console.log('[AudioWS] Connecting to', url);
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      console.error('[AudioWS] Construction threw:', e);
+      return;
+    }
+    ws.binaryType = 'arraybuffer';
+
+    ws.addEventListener('open', () => {
+      console.log('[AudioWS] Connected');
+      reconnectDelay = 1000;
+      // Flip the audio-dot indicator for the self-row on the next poll
+      const selfRow = document.querySelector('#participants-list .pp-row.me .pp-audio-dot');
+      if (selfRow) selfRow.classList.add('ws');
+    });
+
+    ws.addEventListener('message', (ev) => {
+      if (typeof ev.data === 'string') {
+        try {
+          pendingHeader = JSON.parse(ev.data);
+        } catch {
+          pendingHeader = null;
+        }
+        return;
+      }
+      // Binary frame — the WAV bytes corresponding to the last header.
+      const header = pendingHeader;
+      pendingHeader = null;
+      playWavBlob(new Uint8Array(ev.data), header);
+    });
+
+    ws.addEventListener('close', () => {
+      console.log('[AudioWS] Closed, reconnecting in', reconnectDelay + 'ms');
+      const selfRow = document.querySelector('#participants-list .pp-row.me .pp-audio-dot');
+      if (selfRow) selfRow.classList.remove('ws');
+      setTimeout(() => {
+        if (currentSessionId) connect(currentSessionId);
+      }, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    });
+
+    ws.addEventListener('error', (err) => {
+      // close handler will schedule reconnect; nothing to do here.
+      console.warn('[AudioWS] Error:', err);
+    });
+  }
+
+  // Wait for the registration handshake to complete before subscribing.
+  window.addEventListener('mod3-session-registered', (ev) => {
+    const sid = ev.detail && ev.detail.session_id;
+    if (!sid) return;
+    if (ws && currentSessionId === sid) return;  // already subscribed
+    if (ws) { try { ws.close(); } catch {} }
+    connect(sid);
+  });
+
+  // If registration already completed before this IIFE ran, pick it up now.
+  if (window.__mod3Session && window.__mod3Session.session_id) {
+    connect(window.__mod3Session.session_id);
+  }
+
+  // Resume AudioContext on first user gesture — required by autoplay policy.
+  const resumeOnGesture = () => {
+    const ctx = ensureAudioCtx();
+    if (ctx && ctx.state === 'suspended') ctx.resume();
+    window.removeEventListener('click', resumeOnGesture, true);
+    window.removeEventListener('keydown', resumeOnGesture, true);
+  };
+  window.addEventListener('click', resumeOnGesture, true);
+  window.addEventListener('keydown', resumeOnGesture, true);
+})();
 </script>
 
 <!-- Voice chat dependencies (self-hosted) -->
