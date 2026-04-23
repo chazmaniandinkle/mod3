@@ -214,11 +214,86 @@
   /* Leave room at the bottom so the drawer doesn't cover the input */
   body { padding-bottom: 32px; }
 
+  /* Participant panel (ADR-082 / Wave 4) — live session roster. Renders as a
+     collapsible drawer on the right side of the main pane. */
+  .participants-pill {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 0.75rem; color: var(--muted);
+    padding: 4px 10px; border-radius: 12px;
+    background: var(--bg); border: 1px solid var(--border);
+    cursor: pointer; user-select: none;
+  }
+  .participants-pill:hover { border-color: var(--accent); }
+  .participants-pill .count { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .participants-pill .count.me { color: var(--green); }
+  #participants-panel {
+    position: fixed; top: 48px; right: 16px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    width: 320px; max-height: 60vh; overflow-y: auto;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    z-index: 30; display: none; padding: 8px 0;
+  }
+  #participants-panel.open { display: block; }
+  #participants-panel .pp-header {
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+    font-size: 0.7rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.5px; display: flex; align-items: center; gap: 8px;
+  }
+  #participants-panel .pp-header .session-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--text); text-transform: none; letter-spacing: 0;
+    margin-left: auto; font-size: 0.7rem;
+  }
+  #participants-list { list-style: none; padding: 0; margin: 0; }
+  #participants-list .pp-empty {
+    padding: 16px 14px; font-size: 0.8rem; color: var(--muted); text-align: center;
+  }
+  .pp-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px; border-bottom: 1px solid rgba(48,54,61,0.4);
+    font-size: 0.8rem;
+  }
+  .pp-row:last-child { border-bottom: none; }
+  .pp-row.me {
+    background: rgba(63,185,80,0.07);
+    border-left: 2px solid var(--green);
+    padding-left: 12px;
+  }
+  .pp-row .pp-info { flex: 1; min-width: 0; }
+  .pp-row .pp-name { color: var(--text); font-weight: 500; }
+  .pp-row .pp-name .you-marker {
+    display: inline-block; margin-left: 4px; padding: 0 6px;
+    background: var(--green); color: #000; border-radius: 8px;
+    font-size: 0.6rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; vertical-align: middle;
+  }
+  .pp-row .pp-meta {
+    font-size: 0.68rem; color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px;
+  }
+  .pp-row .pp-meta .pp-voice { color: var(--accent); }
+  .pp-row .pp-meta .pp-session { opacity: 0.7; }
+  .pp-row .pp-badge {
+    font-size: 0.6rem; padding: 1px 6px; border-radius: 8px;
+    background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .pp-row .pp-badge.user { color: var(--accent); border-color: var(--accent); }
+  .pp-row .pp-badge.agent { color: var(--orange); border-color: var(--orange); }
+  .pp-row .pp-conflict { color: var(--orange); font-size: 0.65rem; margin-left: 4px; }
+  .pp-row .pp-audio-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--muted); flex-shrink: 0;
+  }
+  .pp-row .pp-audio-dot.ws { background: var(--green); }
+
   /* Responsive */
   @media (max-width: 700px) {
     .main { padding: 12px 16px; }
     .voice-controls { flex-wrap: wrap; }
     .msg { max-width: 90%; }
+    #participants-panel { right: 8px; width: calc(100vw - 16px); }
   }
 </style>
 </head>
@@ -235,6 +310,22 @@
     <span class="status-dot" id="status-mic"></span>
     <span>Mic</span>
   </div>
+  <div class="participants-pill" id="participants-toggle" title="Live sessions on the bus (ADR-082)">
+    <span>&#128101;</span>
+    <span class="count" id="participants-count">0</span>
+    <span>session<span id="participants-plural">s</span></span>
+  </div>
+</div>
+
+<!-- Participant panel (Wave 4) — live /v1/sessions roster -->
+<div id="participants-panel">
+  <div class="pp-header">
+    <span>Participants</span>
+    <span class="session-id" id="participants-self-id">unregistered</span>
+  </div>
+  <ul id="participants-list">
+    <li class="pp-empty">No active sessions</li>
+  </ul>
 </div>
 
 <!-- Main content -->
@@ -666,6 +757,249 @@ chatInput.addEventListener('input', () => {
   chatInput.style.height = 'auto';
   chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
 });
+
+/**
+ * Wave 4 — Session registration + participant panel.
+ *
+ * On page load:
+ *   1. Try to reuse a session_id from sessionStorage (so refreshes reuse the
+ *      same bus identity).
+ *   2. Otherwise, POST to the kernel's /v1/channel-sessions/register (the
+ *      kernel owns minting authority — ADR-082 Wave 3.5). Fall back to mod3's
+ *      direct /v1/sessions/register when the kernel is unreachable so the
+ *      dashboard still works when only mod3 is running.
+ *   3. Poll GET /v1/sessions every 4s to render the live roster.
+ *   4. On beforeunload, best-effort deregister so the voice goes back to the
+ *      pool quickly.
+ *
+ * Exposes window.__mod3Session for the audio-WebSocket code in Wave 4.3 to
+ * consume — that code keys its /ws/audio/{session_id} subscription off this
+ * value.
+ */
+(function setupSessionRegistration() {
+  const KERNEL_URL = 'http://localhost:6931';  // Wave 3.5 kernel-owned authority
+  const SESSION_KEY = 'mod3.sessionId';
+  const POLL_INTERVAL_MS = 4000;
+
+  // Short UUID helper (8 hex chars — matches the kernel's cs- short-id
+  // style for merged displays).
+  function shortUuid() {
+    const bytes = new Uint8Array(4);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // Session state published on window so other scripts can see it.
+  window.__mod3Session = {
+    session_id: null,
+    participant_id: null,
+    assigned_voice: null,
+    registered: false,
+  };
+
+  async function registerSession() {
+    // Reuse cached session if present — refreshes stay on the same identity.
+    const cached = sessionStorage.getItem(SESSION_KEY);
+    const reuseId = cached ? JSON.parse(cached) : null;
+
+    const participantId = (reuseId && reuseId.participant_id) ||
+      ('dashboard-' + shortUuid());
+    const sessionId = reuseId ? reuseId.session_id : undefined;
+
+    const payload = {
+      participant_id: participantId,
+      participant_type: 'user',
+      preferred_voice: null,
+      preferred_output_device: 'system-default',
+    };
+    if (sessionId) payload.session_id = sessionId;
+
+    // 1. Try kernel-owned endpoint first.
+    let data = null;
+    try {
+      const r = await fetch(`${KERNEL_URL}/v1/channel-sessions/register`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...payload, kinds: ['audio']}),
+      });
+      if (r.ok) {
+        data = await r.json();
+        // Kernel returns {kernel: {...}, mod3: {...}} — normalize to mod3 shape
+        if (data.mod3) {
+          data = {...data.mod3, session_id: data.kernel.session_id || data.mod3.session_id};
+        }
+        console.log('[Session] Registered via kernel:', data.session_id);
+      }
+    } catch (e) {
+      console.log('[Session] Kernel unreachable, falling back to mod3 direct:', e.message);
+    }
+
+    // 2. Fallback: mod3 direct registration.
+    if (!data) {
+      try {
+        // Mod3's /v1/sessions/register requires a session_id in the payload —
+        // mint one on the client when we don't have a cached one. This is
+        // fallback-path only; the kernel path auto-mints on empty.
+        const directPayload = {...payload};
+        if (!directPayload.session_id) {
+          directPayload.session_id = 'dashboard-' + shortUuid() + '-' + Date.now();
+        }
+        const r = await fetch('/v1/sessions/register', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(directPayload),
+        });
+        if (r.ok) {
+          data = await r.json();
+          console.log('[Session] Registered via mod3 direct:', data.session_id);
+        } else {
+          console.error('[Session] mod3 register failed:', r.status, await r.text());
+          return;
+        }
+      } catch (e) {
+        console.error('[Session] mod3 register threw:', e);
+        return;
+      }
+    }
+
+    if (!data || !data.session_id) return;
+
+    window.__mod3Session = {
+      session_id: data.session_id,
+      participant_id: data.participant_id || participantId,
+      assigned_voice: data.assigned_voice || null,
+      registered: true,
+    };
+
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify({
+      session_id: data.session_id,
+      participant_id: data.participant_id || participantId,
+    }));
+
+    const selfLabel = document.getElementById('participants-self-id');
+    if (selfLabel) {
+      selfLabel.textContent = data.session_id;
+      selfLabel.style.color = 'var(--green)';
+    }
+
+    // Dispatch event so the audio-WS bootstrap (Wave 4.3) can subscribe.
+    window.dispatchEvent(new CustomEvent('mod3-session-registered', {
+      detail: window.__mod3Session,
+    }));
+  }
+
+  async function pollSessions() {
+    try {
+      const r = await fetch('/v1/sessions');
+      if (!r.ok) return;
+      const body = await r.json();
+      renderParticipantPanel(body.sessions || []);
+    } catch (e) {
+      // silent — the /health pill already tracks connectivity
+    }
+  }
+
+  function renderParticipantPanel(sessions) {
+    const listEl = document.getElementById('participants-list');
+    const countEl = document.getElementById('participants-count');
+    const pluralEl = document.getElementById('participants-plural');
+    if (!listEl || !countEl) return;
+
+    const selfId = window.__mod3Session && window.__mod3Session.session_id;
+
+    countEl.textContent = String(sessions.length);
+    if (pluralEl) pluralEl.textContent = sessions.length === 1 ? '' : 's';
+    if (countEl) {
+      const hasSelf = selfId && sessions.some(s => s.session_id === selfId);
+      countEl.className = hasSelf ? 'count me' : 'count';
+    }
+
+    if (sessions.length === 0) {
+      listEl.innerHTML = '<li class="pp-empty">No active sessions</li>';
+      return;
+    }
+
+    // Sort: self first, then agents, then users, each by registered_at desc
+    const sorted = [...sessions].sort((a, b) => {
+      if (a.session_id === selfId) return -1;
+      if (b.session_id === selfId) return 1;
+      return (b.registered_at || 0) - (a.registered_at || 0);
+    });
+
+    listEl.innerHTML = sorted.map(s => {
+      const isSelf = s.session_id === selfId;
+      const kind = (s.participant_type || 'agent').toLowerCase();
+      const voice = s.assigned_voice || '—';
+      const conflict = s.voice_conflict
+        ? '<span class="pp-conflict" title="voice collision">⚠</span>' : '';
+      const pid = escapeHtml(s.participant_id || '');
+      const sid = escapeHtml(s.session_id || '');
+      const ageSec = s.registered_at ? Math.round(Date.now()/1000 - s.registered_at) : 0;
+      const ageStr = ageSec < 60 ? ageSec + 's' :
+                     ageSec < 3600 ? Math.round(ageSec/60) + 'm' :
+                     Math.round(ageSec/3600) + 'h';
+      const youMarker = isSelf ? ' <span class="you-marker">you</span>' : '';
+      return (
+        '<li class="pp-row ' + (isSelf ? 'me' : '') + '">' +
+          '<span class="pp-audio-dot" title="audio subscription (Wave 4.3)"></span>' +
+          '<div class="pp-info">' +
+            '<div class="pp-name">' + pid + youMarker + conflict + '</div>' +
+            '<div class="pp-meta">' +
+              '<span class="pp-voice">' + escapeHtml(voice) + '</span>' +
+              '<span class="pp-session">' + sid.slice(0,16) +
+                (sid.length > 16 ? '…' : '') + '</span>' +
+              '<span>' + ageStr + '</span>' +
+            '</div>' +
+          '</div>' +
+          '<span class="pp-badge ' + kind + '">' + escapeHtml(kind) + '</span>' +
+        '</li>'
+      );
+    }).join('');
+  }
+
+  // Toggle panel open/close
+  const pillEl = document.getElementById('participants-toggle');
+  const panelEl = document.getElementById('participants-panel');
+  if (pillEl && panelEl) {
+    pillEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      panelEl.classList.toggle('open');
+    });
+    // Click-outside-to-close
+    document.addEventListener('click', (e) => {
+      if (!panelEl.contains(e.target) && !pillEl.contains(e.target)) {
+        panelEl.classList.remove('open');
+      }
+    });
+  }
+
+  async function deregisterOnUnload() {
+    const s = window.__mod3Session;
+    if (!s || !s.session_id) return;
+    // Use navigator.sendBeacon when available — it survives the unload event.
+    const url = `/v1/sessions/${encodeURIComponent(s.session_id)}/deregister`;
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, new Blob(['{}'], {type: 'application/json'}));
+      } else {
+        // Blocking fallback for browsers without sendBeacon.
+        fetch(url, {method: 'POST', keepalive: true, body: '{}',
+          headers: {'Content-Type': 'application/json'}});
+      }
+    } catch {
+      // Best-effort; server sweep will clean up eventually.
+    }
+  }
+
+  window.addEventListener('beforeunload', deregisterOnUnload);
+
+  // Kick off: register, then start polling. Register THEN poll so the
+  // first roster render can mark self correctly.
+  registerSession().finally(() => {
+    pollSessions();
+    setInterval(pollSessions, POLL_INTERVAL_MS);
+  });
+})();
 </script>
 
 <!-- Voice chat dependencies (self-hosted) -->
