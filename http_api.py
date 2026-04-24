@@ -748,7 +748,7 @@ def session_register(req: SessionRegisterRequest):
     Body:
       {
         "session_id": "...",
-        "participant_id": "cog" | "sandy" | "slowbro" | ...,
+        "participant_id": "cog" | "sandy" | "alice" | ...,
         "participant_type": "agent" | "user",
         "preferred_voice": "bm_lewis" | ... | null,
         "preferred_output_device": "system-default" | "<device-name>"

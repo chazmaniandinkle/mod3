@@ -857,7 +857,7 @@ TOOLS = [
             "speaker via a global round-robin serializer.\n\n"
             "Args:\n"
             "    session_id: Caller-chosen id (e.g., the Claude Code session id).\n"
-            "    participant_id: Identity of the speaker (e.g., 'cog', 'sandy', 'slowbro').\n"
+            "    participant_id: Identity of the speaker (e.g., 'cog', 'sandy', 'alice').\n"
             "    participant_type: 'agent' or 'user'. Free-form beyond that.\n"
             "    preferred_voice: Optional voice preset (e.g., 'bm_lewis'). If taken,\n"
             "                     voice_conflict=true is returned but assignment still succeeds.\n"
@@ -870,7 +870,7 @@ TOOLS = [
                 "session_id": {"type": "string", "description": "Caller-chosen session id."},
                 "participant_id": {
                     "type": "string",
-                    "description": "Identity of the speaker (e.g., 'cog', 'sandy', 'slowbro').",
+                    "description": "Identity of the speaker (e.g., 'cog', 'sandy', 'alice').",
                 },
                 "participant_type": {
                     "type": "string",
