@@ -1582,7 +1582,7 @@ def register_session(
 
     Args:
         session_id: Caller-chosen id (e.g., the Claude Code session id).
-        participant_id: Identity of the speaker (e.g., 'cog', 'sandy', 'slowbro').
+        participant_id: Identity of the speaker (e.g., 'cog', 'sandy', 'alice').
         participant_type: 'agent' or 'user'. Free-form beyond that.
         preferred_voice: Optional voice preset. If taken, voice_conflict=true
                          is returned but assignment still succeeds.
