@@ -1659,8 +1659,28 @@ def install_mcp_route(app) -> None:
     http_api.app uses a `lifespan=` context manager, which makes legacy
     `@app.on_event("startup")` hooks silent no-ops — so we wrap the existing
     lifespan instead. Tested by tests/test_mcp_route.py.
+
+    Note: the `mcp` instance is a module-level singleton, and
+    `session_manager.run()` is not re-entrant. Calling this helper a second time
+    would raise a cryptic RuntimeError at lifespan startup, so we guard with an
+    explicit error here. Tests that need a fresh app should reuse the same
+    install — a module-scoped fixture is the canonical pattern.
+
+    Note: the FastMCP sub-app returned by `streamable_http_app()` has its own
+    lifespan that calls `session_manager.run()`, but Starlette does not
+    propagate mounted sub-app lifespans to the parent — that is why we wrap
+    explicitly. If a future FastMCP release moves session startup outside the
+    sub-app lifespan (or adds parent-lifespan propagation), this helper will
+    need to be revisited.
     """
     from contextlib import asynccontextmanager
+
+    if getattr(mcp, "_mod3_route_installed", False):
+        raise RuntimeError(
+            "install_mcp_route() called more than once on the same FastMCP "
+            "singleton — session_manager.run() is not re-entrant. Reuse the "
+            "first-installed app (e.g. via a module-scoped pytest fixture)."
+        )
 
     app.mount("/mcp", mcp.streamable_http_app())
 
@@ -1673,6 +1693,7 @@ def install_mcp_route(app) -> None:
                 yield
 
     app.router.lifespan_context = _combined_lifespan
+    mcp._mod3_route_installed = True
 
 
 def _run_http(host: str = "0.0.0.0", port: int = 7860):
