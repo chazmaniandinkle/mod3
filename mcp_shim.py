@@ -29,6 +29,8 @@ import wave
 from collections import OrderedDict
 from typing import Any
 
+from _version import __version__
+
 logger = logging.getLogger("mod3.shim")
 
 MOD3_BASE = os.environ.get("MOD3_URL", "http://localhost:7860")
@@ -1020,7 +1022,7 @@ TOOL_DISPATCH = {
 
 SERVER_INFO = {
     "name": "mod3",
-    "version": "0.3.0-shim",
+    "version": f"{__version__}-shim",
 }
 
 CAPABILITIES = {
