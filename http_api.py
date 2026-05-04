@@ -48,6 +48,8 @@ from session_registry import (
 from vad import detect_speech_file, is_hallucination
 from vad import is_model_loaded as vad_loaded
 
+from _version import __version__
+
 logger = logging.getLogger("mod3.http")
 
 _server_start_time = time.time()
@@ -891,7 +893,7 @@ def health():
         return {
             "status": status,
             "service": "mod3",
-            "version": "0.3.0",
+            "version": __version__,
             "uptime_sec": round(time.time() - _server_start_time, 1),
             "engines": engines,
             "modalities": modalities,
@@ -906,7 +908,7 @@ def health():
             content={
                 "status": "error",
                 "service": "mod3",
-                "version": "0.3.0",
+                "version": __version__,
                 "error": str(e),
             },
         )
@@ -975,7 +977,7 @@ def capabilities():
     voices = {name: cfg["voices"] for name, cfg in MODELS.items()}
     return {
         "service": "mod3",
-        "version": "0.3.0",
+        "version": __version__,
         "description": "Model Modality Modulator — local TTS, STT, and VAD on Apple Silicon",
         "modalities": ["voice"],
         "capabilities": {
