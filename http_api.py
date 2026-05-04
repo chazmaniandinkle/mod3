@@ -35,6 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from _version import __version__
 from audio_subscribers import get_default_audio_subscribers
 from bus import ModalityBus
 from engine import MODELS, generate_audio, get_loaded_engines
@@ -47,8 +48,6 @@ from session_registry import (
 )
 from vad import detect_speech_file, is_hallucination
 from vad import is_model_loaded as vad_loaded
-
-from _version import __version__
 
 logger = logging.getLogger("mod3.http")
 

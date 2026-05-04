@@ -15,7 +15,7 @@ from pathlib import Path
 def _read_version() -> str:
     # Preferred path: package metadata installed by pip / uv.
     try:
-        from importlib.metadata import PackageNotFoundError, version
+        from importlib.metadata import version
 
         return version("mod3")
     except Exception:
